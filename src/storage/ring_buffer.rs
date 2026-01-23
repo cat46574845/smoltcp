@@ -407,6 +407,98 @@ impl<'a, T: 'a> From<ManagedSlice<'a, T>> for RingBuffer<'a, T> {
     }
 }
 
+// === SocketBufferT implementation for RingBuffer<'a, u8> ===
+
+use super::buffer_trait::SocketBufferT;
+
+impl<'a> SocketBufferT<'a> for RingBuffer<'a, u8> {
+    fn new<S: Into<ManagedSlice<'a, u8>>>(storage: S) -> Self {
+        RingBuffer::new(storage)
+    }
+
+    fn clear(&mut self) {
+        RingBuffer::clear(self)
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        RingBuffer::capacity(self)
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        RingBuffer::len(self)
+    }
+
+    #[inline]
+    fn window(&self) -> usize {
+        RingBuffer::window(self)
+    }
+
+    #[inline]
+    fn contiguous_window(&self) -> usize {
+        RingBuffer::contiguous_window(self)
+    }
+
+    fn enqueue_many_with<'b, R, F>(&'b mut self, f: F) -> (usize, R)
+    where
+        F: FnOnce(&'b mut [u8]) -> (usize, R),
+    {
+        RingBuffer::enqueue_many_with(self, f)
+    }
+
+    fn dequeue_many_with<'b, R, F>(&'b mut self, f: F) -> (usize, R)
+    where
+        F: FnOnce(&'b mut [u8]) -> (usize, R),
+    {
+        RingBuffer::dequeue_many_with(self, f)
+    }
+
+    fn get_unallocated(&mut self, offset: usize, size: usize) -> &mut [u8] {
+        RingBuffer::get_unallocated(self, offset, size)
+    }
+
+    fn write_unallocated(&mut self, offset: usize, data: &[u8]) -> usize {
+        RingBuffer::write_unallocated(self, offset, data)
+    }
+
+    fn enqueue_unallocated(&mut self, count: usize) {
+        RingBuffer::enqueue_unallocated(self, count)
+    }
+
+    fn get_allocated(&self, offset: usize, size: usize) -> &[u8] {
+        RingBuffer::get_allocated(self, offset, size)
+    }
+
+    fn read_allocated(&mut self, offset: usize, data: &mut [u8]) -> usize {
+        RingBuffer::read_allocated(self, offset, data)
+    }
+
+    fn dequeue_allocated(&mut self, count: usize) {
+        RingBuffer::dequeue_allocated(self, count)
+    }
+
+    #[inline]
+    fn enqueue_slice(&mut self, data: &[u8]) -> usize {
+        RingBuffer::enqueue_slice(self, data)
+    }
+
+    #[inline]
+    fn dequeue_slice(&mut self, data: &mut [u8]) -> usize {
+        RingBuffer::dequeue_slice(self, data)
+    }
+
+    #[inline]
+    fn enqueue_many(&mut self, size: usize) -> &mut [u8] {
+        RingBuffer::enqueue_many(self, size)
+    }
+
+    #[inline]
+    fn dequeue_many(&mut self, size: usize) -> &mut [u8] {
+        RingBuffer::dequeue_many(self, size)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

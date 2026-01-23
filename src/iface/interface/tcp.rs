@@ -41,7 +41,7 @@ impl InterfaceInner {
             None
         } else {
             // The packet wasn't handled by a socket, send a TCP RST packet.
-            let (ip, tcp) = tcp::Socket::rst_reply(&ip_repr, &tcp_repr);
+            let (ip, tcp) = Socket::<crate::socket::tcp::SocketBuffer<'_>>::rst_reply(&ip_repr, &tcp_repr);
             Some(Packet::new(ip, IpPayload::Tcp(tcp)))
         }
     }
