@@ -92,9 +92,9 @@ impl InterfaceInner {
         })
     }
 
-    pub(super) fn process_ipv4<'a>(
+    pub(super) fn process_ipv4<'a, 's, B: SocketBufferT<'s>>(
         &mut self,
-        sockets: &mut SocketSet,
+        sockets: &mut SocketSet<'s, B>,
         meta: PacketMeta,
         source_hardware_addr: HardwareAddress,
         ipv4_packet: &Ipv4Packet<&'a [u8]>,
@@ -320,9 +320,9 @@ impl InterfaceInner {
         }
     }
 
-    pub(super) fn process_icmpv4<'frame>(
+    pub(super) fn process_icmpv4<'frame, 's, B: SocketBufferT<'s>>(
         &mut self,
-        _sockets: &mut SocketSet,
+        _sockets: &mut SocketSet<'s, B>,
         ip_repr: Ipv4Repr,
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {

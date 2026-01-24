@@ -47,7 +47,7 @@ fn main() {
     // IMPORTANT: This should be removed in production.
     dhcp_socket.set_max_lease_duration(Some(Duration::from_secs(10)));
 
-    let mut sockets = SocketSet::new(vec![]);
+    let mut sockets: SocketSet<'_> = SocketSet::new(vec![]);
     let dhcp_handle = sockets.add(dhcp_socket);
 
     loop {

@@ -981,6 +981,7 @@ impl<'a, B: SocketBufferT<'a>> Socket<'a, B> {
     /// # ))]
     /// # {
     /// # use smoltcp::socket::tcp::{Socket, SocketBuffer};
+    /// # use smoltcp::storage::RingBuffer;
     /// # use smoltcp::iface::Interface;
     /// # use smoltcp::wire::IpAddress;
     /// #
@@ -988,7 +989,7 @@ impl<'a, B: SocketBufferT<'a>> Socket<'a, B> {
     /// #     49152
     /// # }
     /// #
-    /// # let mut socket = Socket::new(
+    /// # let mut socket: Socket<'_, RingBuffer<'_, u8>> = Socket::new(
     /// #     SocketBuffer::new(vec![0; 1200]),
     /// #     SocketBuffer::new(vec![0; 1200])
     /// # );
@@ -9002,50 +9003,6 @@ mod test {
             s.state = State::Listen;
             s.listen_endpoint = LISTEN_END;
             s
-        }
-
-        fn socket_half_open() -> TestSocket<LinearBuffer<'static>> {
-            let mut s = socket_established();
-            s.remote_last_ts = Some(Instant::from_millis(0));
-            s
-        }
-
-        fn setup_rfc2018_cases() -> (TestSocket<LinearBuffer<'static>>, Vec<u8>) {
-            let mut s = socket_established_with_buffer_sizes(4000, 4000);
-            s.remote_has_sack = true;
-
-            let mut segment: Vec<u8> = Vec::with_capacity(500);
-            for _ in 0..50 {
-                segment.extend_from_slice(b"abcdefghij")
-            }
-            for offset in (0..5000).step_by(500) {
-                send!(
-                    s,
-                    TcpRepr {
-                        seq_number: REMOTE_SEQ + 1 + offset,
-                        ack_number: Some(LOCAL_SEQ + 1),
-                        payload: &segment,
-                        ..SEND_TEMPL
-                    }
-                );
-                recv!(
-                    s,
-                    [TcpRepr {
-                        seq_number: LOCAL_SEQ + 1,
-                        ack_number: Some(REMOTE_SEQ + 1 + offset + 500),
-                        window_len: 3500,
-                        ..RECV_TEMPL
-                    }]
-                );
-                s.recv(|data| {
-                    assert_eq!(data.len(), 500);
-                    assert_eq!(data, segment.as_slice());
-                    (500, ())
-                })
-                .unwrap();
-            }
-            assert_eq!(s.remote_last_win, 3500);
-            (s, segment)
         }
 
         // Include all tests via include! macro from a generated file would be ideal,

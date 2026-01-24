@@ -49,9 +49,9 @@ impl InterfaceInner {
         tag
     }
 
-    pub(super) fn process_sixlowpan<'output, 'payload: 'output>(
+    pub(super) fn process_sixlowpan<'output, 'payload: 'output, 's, B: SocketBufferT<'s>>(
         &mut self,
-        sockets: &mut SocketSet,
+        sockets: &mut SocketSet<'s, B>,
         meta: PacketMeta,
         ieee802154_repr: &Ieee802154Repr,
         payload: &'payload [u8],

@@ -177,7 +177,7 @@ fn main() {
     let tcp2_tx_buffer = tcp::SocketBuffer::new(vec![0; 4096]);
     let tcp2_socket = tcp::Socket::new(tcp2_rx_buffer, tcp2_tx_buffer);
 
-    let mut sockets = SocketSet::new(vec![]);
+    let mut sockets: SocketSet<'_> = SocketSet::new(vec![]);
     let tcp1_handle = sockets.add(tcp1_socket);
     let tcp2_handle = sockets.add(tcp2_socket);
 

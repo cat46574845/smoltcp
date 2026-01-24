@@ -44,6 +44,7 @@ use crate::phy::PacketMeta;
 use crate::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use crate::rand::Rand;
 use crate::socket::*;
+use crate::storage::SocketBufferT;
 use crate::time::{Duration, Instant};
 
 use crate::wire::*;
@@ -442,11 +443,11 @@ impl Interface {
     /// [`poll_egress()`](Self::poll_egress) and [`poll_ingress_single()`](Self::poll_ingress_single).
     /// This allows you to insert yields or process other events between processing
     /// individual ingress packets.
-    pub fn poll(
+    pub fn poll<'s, B: SocketBufferT<'s>>(
         &mut self,
         timestamp: Instant,
         device: &mut (impl Device + ?Sized),
-        sockets: &mut SocketSet<'_>,
+        sockets: &mut SocketSet<'s, B>,
     ) -> PollResult {
         self.inner.now = timestamp;
 
@@ -481,11 +482,11 @@ impl Interface {
     /// might have changed.
     ///
     /// This is guaranteed to always perform a bounded amount of work.
-    pub fn poll_egress(
+    pub fn poll_egress<'s, B: SocketBufferT<'s>>(
         &mut self,
         timestamp: Instant,
         device: &mut (impl Device + ?Sized),
-        sockets: &mut SocketSet<'_>,
+        sockets: &mut SocketSet<'s, B>,
     ) -> PollResult {
         self.inner.now = timestamp;
 
@@ -515,11 +516,11 @@ impl Interface {
     /// - whether the state of any socket might have changed.
     ///
     /// Since it processes at most one packet, this is guaranteed to always perform a bounded amount of work.
-    pub fn poll_ingress_single(
+    pub fn poll_ingress_single<'s, B: SocketBufferT<'s>>(
         &mut self,
         timestamp: Instant,
         device: &mut (impl Device + ?Sized),
-        sockets: &mut SocketSet<'_>,
+        sockets: &mut SocketSet<'s, B>,
     ) -> PollIngressSingleResult {
         self.inner.now = timestamp;
 
@@ -537,7 +538,7 @@ impl Interface {
     ///
     /// [poll]: #method.poll
     /// [Instant]: struct.Instant.html
-    pub fn poll_at(&mut self, timestamp: Instant, sockets: &SocketSet<'_>) -> Option<Instant> {
+    pub fn poll_at<'s, B: SocketBufferT<'s>>(&mut self, timestamp: Instant, sockets: &SocketSet<'s, B>) -> Option<Instant> {
         self.inner.now = timestamp;
 
         #[cfg(feature = "_proto-fragmentation")]
@@ -571,7 +572,7 @@ impl Interface {
     ///
     /// [poll]: #method.poll
     /// [Duration]: struct.Duration.html
-    pub fn poll_delay(&mut self, timestamp: Instant, sockets: &SocketSet<'_>) -> Option<Duration> {
+    pub fn poll_delay<'s, B: SocketBufferT<'s>>(&mut self, timestamp: Instant, sockets: &SocketSet<'s, B>) -> Option<Duration> {
         match self.poll_at(timestamp, sockets) {
             Some(poll_at) if timestamp < poll_at => Some(poll_at - timestamp),
             Some(_) => Some(Duration::from_millis(0)),
@@ -579,10 +580,10 @@ impl Interface {
         }
     }
 
-    fn socket_ingress(
+    fn socket_ingress<'s, B: SocketBufferT<'s>>(
         &mut self,
         device: &mut (impl Device + ?Sized),
-        sockets: &mut SocketSet<'_>,
+        sockets: &mut SocketSet<'s, B>,
     ) -> PollIngressSingleResult {
         let Some((rx_token, tx_token)) = device.receive(self.inner.now) else {
             return PollIngressSingleResult::None;
@@ -652,10 +653,10 @@ impl Interface {
         })
     }
 
-    fn socket_egress(
+    fn socket_egress<'s, B: SocketBufferT<'s>>(
         &mut self,
         device: &mut (impl Device + ?Sized),
-        sockets: &mut SocketSet<'_>,
+        sockets: &mut SocketSet<'s, B>,
     ) -> PollResult {
         let _caps = device.capabilities();
 
@@ -859,9 +860,9 @@ impl InterfaceInner {
     }
 
     #[cfg(feature = "medium-ip")]
-    fn process_ip<'frame>(
+    fn process_ip<'frame, 's, B: SocketBufferT<'s>>(
         &mut self,
-        sockets: &mut SocketSet,
+        sockets: &mut SocketSet<'s, B>,
         meta: PacketMeta,
         ip_payload: &'frame [u8],
         frag: &'frame mut FragmentsBuffer,
@@ -883,9 +884,9 @@ impl InterfaceInner {
     }
 
     #[cfg(feature = "socket-raw")]
-    fn raw_socket_filter(
+    fn raw_socket_filter<'s, B: SocketBufferT<'s>>(
         &mut self,
-        sockets: &mut SocketSet,
+        sockets: &mut SocketSet<'s, B>,
         ip_repr: &IpRepr,
         ip_payload: &[u8],
     ) -> bool {

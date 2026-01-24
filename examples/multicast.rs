@@ -59,7 +59,7 @@ fn main() {
         .unwrap();
 
     // Create sockets
-    let mut sockets = SocketSet::new(vec![]);
+    let mut sockets: SocketSet<'_> = SocketSet::new(vec![]);
 
     // Must fit at least one IGMP packet
     let raw_rx_buffer = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 2], vec![0; 512]);

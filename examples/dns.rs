@@ -61,7 +61,7 @@ fn main() {
     ];
     let dns_socket = dns::Socket::new(servers, vec![]);
 
-    let mut sockets = SocketSet::new(vec![]);
+    let mut sockets: SocketSet<'_> = SocketSet::new(vec![]);
     let dns_handle = sockets.add(dns_socket);
 
     let socket = sockets.get_mut::<dns::Socket>(dns_handle);

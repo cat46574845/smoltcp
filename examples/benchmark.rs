@@ -102,7 +102,7 @@ fn main() {
             .unwrap();
     });
 
-    let mut sockets = SocketSet::new(vec![]);
+    let mut sockets: SocketSet<'_> = SocketSet::new(vec![]);
     let tcp1_handle = sockets.add(tcp1_socket);
     let tcp2_handle = sockets.add(tcp2_socket);
     let default_timeout = Some(Duration::from_millis(1000));

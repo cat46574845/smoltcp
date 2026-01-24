@@ -82,7 +82,7 @@ fn main() {
     let tcp4_tx_buffer = tcp::SocketBuffer::new(vec![0; 65535]);
     let tcp4_socket = tcp::Socket::new(tcp4_rx_buffer, tcp4_tx_buffer);
 
-    let mut sockets = SocketSet::new(vec![]);
+    let mut sockets: SocketSet<'_> = SocketSet::new(vec![]);
     let udp_handle = sockets.add(udp_socket);
     let tcp1_handle = sockets.add(tcp1_socket);
     let tcp2_handle = sockets.add(tcp2_socket);

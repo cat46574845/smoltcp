@@ -45,6 +45,8 @@ pub(crate) enum PollAt {
     Ingress,
 }
 
+use crate::storage::{SocketBufferT, RingBuffer};
+
 /// A network socket.
 ///
 /// This enumeration abstracts the various types of sockets based on the IP protocol.
@@ -53,11 +55,14 @@ pub(crate) enum PollAt {
 ///
 /// It is usually more convenient to use [SocketSet::get] instead.
 ///
+/// The type parameter `B` specifies the buffer type for TCP sockets.
+/// It defaults to `RingBuffer<'a, u8>` for backwards compatibility.
+///
 /// [AnySocket]: trait.AnySocket.html
 /// [SocketSet::get]: struct.SocketSet.html#method.get
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
-pub enum Socket<'a> {
+pub enum Socket<'a, B: SocketBufferT<'a> = RingBuffer<'a, u8>> {
     #[cfg(feature = "socket-raw")]
     Raw(raw::Socket<'a>),
     #[cfg(feature = "socket-icmp")]
@@ -65,14 +70,14 @@ pub enum Socket<'a> {
     #[cfg(feature = "socket-udp")]
     Udp(udp::Socket<'a>),
     #[cfg(feature = "socket-tcp")]
-    Tcp(tcp::Socket<'a>),
+    Tcp(tcp::Socket<'a, B>),
     #[cfg(feature = "socket-dhcpv4")]
     Dhcpv4(dhcpv4::Socket<'a>),
     #[cfg(feature = "socket-dns")]
     Dns(dns::Socket<'a>),
 }
 
-impl<'a> Socket<'a> {
+impl<'a, B: SocketBufferT<'a>> Socket<'a, B> {
     pub(crate) fn poll_at(&self, cx: &mut Context) -> PollAt {
         match self {
             #[cfg(feature = "socket-raw")]
@@ -92,24 +97,26 @@ impl<'a> Socket<'a> {
 }
 
 /// A conversion trait for network sockets.
-pub trait AnySocket<'a> {
-    fn upcast(self) -> Socket<'a>;
-    fn downcast<'c>(socket: &'c Socket<'a>) -> Option<&'c Self>
+///
+/// The type parameter `B` specifies the buffer type for TCP sockets.
+pub trait AnySocket<'a, B: SocketBufferT<'a> = RingBuffer<'a, u8>> {
+    fn upcast(self) -> Socket<'a, B>;
+    fn downcast<'c>(socket: &'c Socket<'a, B>) -> Option<&'c Self>
     where
         Self: Sized;
-    fn downcast_mut<'c>(socket: &'c mut Socket<'a>) -> Option<&'c mut Self>
+    fn downcast_mut<'c>(socket: &'c mut Socket<'a, B>) -> Option<&'c mut Self>
     where
         Self: Sized;
 }
 
 macro_rules! from_socket {
     ($socket:ty, $variant:ident) => {
-        impl<'a> AnySocket<'a> for $socket {
-            fn upcast(self) -> Socket<'a> {
+        impl<'a, B: SocketBufferT<'a>> AnySocket<'a, B> for $socket {
+            fn upcast(self) -> Socket<'a, B> {
                 Socket::$variant(self)
             }
 
-            fn downcast<'c>(socket: &'c Socket<'a>) -> Option<&'c Self> {
+            fn downcast<'c>(socket: &'c Socket<'a, B>) -> Option<&'c Self> {
                 #[allow(unreachable_patterns)]
                 match socket {
                     Socket::$variant(socket) => Some(socket),
@@ -117,10 +124,44 @@ macro_rules! from_socket {
                 }
             }
 
-            fn downcast_mut<'c>(socket: &'c mut Socket<'a>) -> Option<&'c mut Self> {
+            fn downcast_mut<'c>(socket: &'c mut Socket<'a, B>) -> Option<&'c mut Self> {
                 #[allow(unreachable_patterns)]
                 match socket {
                     Socket::$variant(socket) => Some(socket),
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+/// Macro for implementing AnySocket for TCP sockets with custom buffer types.
+///
+/// External crates can use this macro to implement `AnySocket` for their custom buffer types:
+/// ```ignore
+/// smoltcp::from_tcp_socket!(LinearBuffer<'a>);
+/// ```
+#[macro_export]
+#[cfg(feature = "socket-tcp")]
+macro_rules! from_tcp_socket {
+    ($buffer_ty:ty) => {
+        impl<'a> $crate::socket::AnySocket<'a, $buffer_ty> for $crate::socket::tcp::Socket<'a, $buffer_ty> {
+            fn upcast(self) -> $crate::socket::Socket<'a, $buffer_ty> {
+                $crate::socket::Socket::Tcp(self)
+            }
+
+            fn downcast<'c>(socket: &'c $crate::socket::Socket<'a, $buffer_ty>) -> Option<&'c Self> {
+                #[allow(unreachable_patterns)]
+                match socket {
+                    $crate::socket::Socket::Tcp(socket) => Some(socket),
+                    _ => None,
+                }
+            }
+
+            fn downcast_mut<'c>(socket: &'c mut $crate::socket::Socket<'a, $buffer_ty>) -> Option<&'c mut Self> {
+                #[allow(unreachable_patterns)]
+                match socket {
+                    $crate::socket::Socket::Tcp(socket) => Some(socket),
                     _ => None,
                 }
             }
@@ -135,7 +176,9 @@ from_socket!(icmp::Socket<'a>, Icmp);
 #[cfg(feature = "socket-udp")]
 from_socket!(udp::Socket<'a>, Udp);
 #[cfg(feature = "socket-tcp")]
-from_socket!(tcp::Socket<'a>, Tcp);
+from_tcp_socket!(RingBuffer<'a, u8>);
+#[cfg(feature = "socket-tcp")]
+from_tcp_socket!(crate::storage::LinearBuffer<'a>);
 #[cfg(feature = "socket-dhcpv4")]
 from_socket!(dhcpv4::Socket<'a>, Dhcpv4);
 #[cfg(feature = "socket-dns")]

@@ -7,9 +7,9 @@ use crate::socket::dns::Socket as DnsSocket;
 use crate::socket::udp::Socket as UdpSocket;
 
 impl InterfaceInner {
-    pub(super) fn process_udp<'frame>(
+    pub(super) fn process_udp<'frame, 's, B: SocketBufferT<'s>>(
         &mut self,
-        sockets: &mut SocketSet,
+        sockets: &mut SocketSet<'s, B>,
         meta: PacketMeta,
         handled_by_raw_socket: bool,
         ip_repr: IpRepr,

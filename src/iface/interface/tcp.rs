@@ -1,11 +1,9 @@
 use super::*;
 
-use crate::socket::tcp::Socket;
-
 impl InterfaceInner {
-    pub(crate) fn process_tcp<'frame>(
+    pub(crate) fn process_tcp<'frame, 's, B: SocketBufferT<'s>>(
         &mut self,
-        sockets: &mut SocketSet,
+        sockets: &mut SocketSet<'s, B>,
         handled_by_raw_socket: bool,
         ip_repr: IpRepr,
         ip_payload: &'frame [u8],
@@ -19,14 +17,13 @@ impl InterfaceInner {
             &self.caps.checksum
         ));
 
-        for tcp_socket in sockets
-            .items_mut()
-            .filter_map(|i| Socket::downcast_mut(&mut i.socket))
-        {
-            if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
-                return tcp_socket
-                    .process(self, &ip_repr, &tcp_repr)
-                    .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
+        for item in sockets.items_mut() {
+            if let crate::socket::Socket::Tcp(ref mut tcp_socket) = item.socket {
+                if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
+                    return tcp_socket
+                        .process(self, &ip_repr, &tcp_repr)
+                        .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
+                }
             }
         }
 
@@ -41,7 +38,7 @@ impl InterfaceInner {
             None
         } else {
             // The packet wasn't handled by a socket, send a TCP RST packet.
-            let (ip, tcp) = Socket::<crate::socket::tcp::SocketBuffer<'_>>::rst_reply(&ip_repr, &tcp_repr);
+            let (ip, tcp) = crate::socket::tcp::Socket::<crate::socket::tcp::SocketBuffer<'_>>::rst_reply(&ip_repr, &tcp_repr);
             Some(Packet::new(ip, IpPayload::Tcp(tcp)))
         }
     }
