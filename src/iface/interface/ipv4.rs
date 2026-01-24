@@ -98,7 +98,7 @@ impl InterfaceInner {
         meta: PacketMeta,
         source_hardware_addr: HardwareAddress,
         ipv4_packet: &Ipv4Packet<&'a [u8]>,
-        frag: &'a mut FragmentsBuffer,
+        #[allow(unused_variables)] frag: &'a mut FragmentsBuffer,
     ) -> Option<Packet<'a>> {
         let ipv4_repr = check!(Ipv4Repr::parse(ipv4_packet, &self.caps.checksum));
         if !self.is_unicast_v4(ipv4_repr.src_addr) && !ipv4_repr.src_addr.is_unspecified() {

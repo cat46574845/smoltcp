@@ -31,14 +31,16 @@ use heapless::Vec;
 
 #[cfg(feature = "_proto-fragmentation")]
 use super::fragmentation::FragKey;
-#[cfg(any(feature = "proto-ipv4", feature = "proto-sixlowpan"))]
+#[cfg(feature = "proto-ipv4-fragmentation")]
 use super::fragmentation::PacketAssemblerSet;
 use super::fragmentation::{Fragmenter, FragmentsBuffer};
 
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use super::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache};
 use super::socket_set::SocketSet;
-use crate::config::{IFACE_MAX_ADDR_COUNT, IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT};
+#[cfg(feature = "proto-sixlowpan")]
+use crate::config::IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT;
+use crate::config::IFACE_MAX_ADDR_COUNT;
 use crate::iface::Routes;
 use crate::phy::PacketMeta;
 use crate::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -1175,8 +1177,10 @@ impl InterfaceInner {
 
         // If the medium is Ethernet, then we need to retrieve the destination hardware address.
         #[cfg(feature = "medium-ethernet")]
+        #[allow(unreachable_patterns)]
         let (dst_hardware_addr, mut tx_token) = match self.caps.medium {
             Medium::Ethernet => {
+                #[allow(unreachable_patterns)]
                 match self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), frag)? {
                     (HardwareAddress::Ethernet(addr), tx_token) => (addr, tx_token),
                     (_, _) => unreachable!(),
@@ -1216,6 +1220,7 @@ impl InterfaceInner {
 
         match &mut ip_repr {
             #[cfg(feature = "proto-ipv4")]
+            #[allow(unused_variables)]
             IpRepr::Ipv4(repr) => {
                 // If we have an IPv4 packet, then we need to check if we need to fragment it.
                 if total_ip_len > self.caps.ip_mtu() {
