@@ -16,7 +16,7 @@ mod buffer_tests;
 
 pub use self::assembler::Assembler;
 pub use self::buffer_trait::SocketBufferT;
-pub use self::linear_buffer::{LinearBuffer, DEFAULT_COMPACT_THRESHOLD};
+pub use self::linear_buffer::{LinearBuffer, DEFAULT_WINDOW_RESERVE};
 pub use self::packet_buffer::{PacketBuffer, PacketMetadata};
 pub use self::ring_buffer::RingBuffer;
 

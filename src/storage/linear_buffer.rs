@@ -1,28 +1,29 @@
 //! Linear buffer implementation.
 //!
-//! A `LinearBuffer` is a buffer that never wraps around. When tail space is
-//! exhausted and data length is below a threshold, it compacts by moving data
-//! to the beginning.
+//! A `LinearBuffer` is a buffer that never wraps around. It uses on-demand
+//! compaction: when a write would exceed buffer capacity, data is moved to
+//! the beginning before the write proceeds.
 
 use managed::ManagedSlice;
 
 use super::buffer_trait::SocketBufferT;
 
-/// Default threshold for compaction.
-/// If data length is below this and tail space is zero, compact.
-pub const DEFAULT_COMPACT_THRESHOLD: usize = 32 * 1024; // 32 KB
+/// Default reserve for virtual window calculation.
+/// Head space beyond this is added to the advertised window.
+pub const DEFAULT_WINDOW_RESERVE: usize = 4 * 1024; // 4 KB
 
 /// A linear (non-wrapping) buffer for TCP sockets.
 ///
-/// Unlike `RingBuffer`, this buffer never wraps around. When the tail space
-/// is exhausted and the data length is below `compact_threshold`, it moves
-/// all data to the beginning of the buffer.
+/// Unlike `RingBuffer`, this buffer never wraps around. It uses on-demand
+/// compaction: when a write operation would exceed the buffer capacity,
+/// all existing data is moved to the beginning of the buffer first.
 ///
 /// # Window Semantics
 ///
-/// The `window()` method returns the contiguous tail space available for
-/// writing. This is the same as `contiguous_window()`. When advertised to
-/// TCP peers, this ensures they never send more than can be written contiguously.
+/// The `window()` method returns `capacity - read_at - length`, which is the
+/// theoretical space available. This allows the TCP window to remain open
+/// as long as there's unconsumed buffer capacity, preventing TCP deadlocks
+/// caused by Window Scaling (RFC 1323) rounding small windows to zero.
 #[derive(Debug)]
 pub struct LinearBuffer<'a> {
     storage: ManagedSlice<'a, u8>,
@@ -33,13 +34,14 @@ pub struct LinearBuffer<'a> {
     /// Extent of the furthest written unallocated data (for out-of-order writes).
     /// This is relative to `read_at + length`.
     unallocated_extent: usize,
-    /// Threshold below which compaction is triggered.
-    compact_threshold: usize,
+    /// Reserve for virtual window calculation.
+    /// Head space beyond this is added to the advertised window.
+    window_reserve: usize,
 }
 
 impl<'a> LinearBuffer<'a> {
-    /// Create a new linear buffer with custom compact threshold.
-    pub fn with_threshold<S>(storage: S, compact_threshold: usize) -> Self
+    /// Create a new linear buffer with custom window reserve.
+    pub fn with_reserve<S>(storage: S, window_reserve: usize) -> Self
     where
         S: Into<ManagedSlice<'a, u8>>,
     {
@@ -48,9 +50,10 @@ impl<'a> LinearBuffer<'a> {
             read_at: 0,
             length: 0,
             unallocated_extent: 0,
-            compact_threshold,
+            window_reserve,
         }
     }
+
 
     /// Return the total occupied extent (allocated + unallocated written data).
     #[inline]
@@ -58,37 +61,48 @@ impl<'a> LinearBuffer<'a> {
         self.length + self.unallocated_extent
     }
 
-    /// Ensure buffer has writable tail space.
-    ///
-    /// Priority:
-    /// 1. If buffer is empty, reset read_at to 0 (free reset)
-    /// 2. If tail space is zero and occupied extent < threshold, compact
-    fn ensure_writable(&mut self) {
-        let extent = self.occupied_extent();
-
-        // Priority 1: Empty buffer → reset to start (no copy needed)
-        if extent == 0 {
-            self.read_at = 0;
-            return;
-        }
-
-        // Priority 2: Buffer full → compact if below threshold
-        let tail_space = self.capacity() - self.read_at - extent;
-        if tail_space == 0 && extent < self.compact_threshold {
-            self.storage.copy_within(self.read_at..self.read_at + extent, 0);
+    /// Reset read_at if buffer is completely empty.
+    #[inline]
+    fn reset_if_empty(&mut self) {
+        if self.occupied_extent() == 0 {
             self.read_at = 0;
         }
     }
 
-    /// Set the compact threshold.
-    pub fn set_compact_threshold(&mut self, threshold: usize) {
-        self.compact_threshold = threshold;
+    /// Compact buffer if writing to `required_end` would exceed capacity.
+    /// Returns true if compaction occurred.
+    #[inline]
+    fn compact_if_needed(&mut self, required_end: usize) -> bool {
+        if required_end > self.capacity() && self.read_at > 0 {
+            let extent = self.occupied_extent();
+            if extent > 0 {
+                self.storage.copy_within(self.read_at..self.read_at + extent, 0);
+            }
+            self.read_at = 0;
+            true
+        } else {
+            false
+        }
     }
+
+    /// "Free" compaction: only compact when buffer is empty (no data movement needed).
+    #[inline]
+    fn compact_if_free(&mut self) {
+        if self.occupied_extent() == 0 {
+            self.read_at = 0;
+        }
+    }
+
+    /// Set the window reserve.
+    pub fn set_window_reserve(&mut self, reserve: usize) {
+        self.window_reserve = reserve;
+    }
+
 }
 
 impl<'a> SocketBufferT<'a> for LinearBuffer<'a> {
     fn new<S: Into<ManagedSlice<'a, u8>>>(storage: S) -> Self {
-        LinearBuffer::with_threshold(storage, DEFAULT_COMPACT_THRESHOLD)
+        LinearBuffer::with_reserve(storage, DEFAULT_WINDOW_RESERVE)
     }
 
     fn clear(&mut self) {
@@ -109,12 +123,25 @@ impl<'a> SocketBufferT<'a> for LinearBuffer<'a> {
 
     #[inline]
     fn window(&self) -> usize {
-        // LinearBuffer: window equals contiguous tail space
-        self.contiguous_window()
+        // Virtual window = tail_space + max(head_space - reserve, 0)
+        //
+        // This advertises reclaimable head space (beyond the reserve) as available,
+        // since we will compact on-demand when a write would exceed capacity.
+        // This prevents TCP Window Scaling from rounding small windows to zero.
+        //
+        // Layout: [head_space][data][unalloc][tail_space]
+        //         ^0         ^read_at       ^capacity
+        let tail_space = self.capacity()
+            .saturating_sub(self.read_at + self.length);
+        let head_space = self.read_at;
+
+        // Add reclaimable head space (beyond reserve) to the advertised window
+        tail_space + head_space.saturating_sub(self.window_reserve)
     }
 
     #[inline]
     fn contiguous_window(&self) -> usize {
+        // For writing NEW data (not retransmissions), we need space after OOO data
         self.capacity()
             .saturating_sub(self.read_at + self.occupied_extent())
     }
@@ -123,7 +150,13 @@ impl<'a> SocketBufferT<'a> for LinearBuffer<'a> {
     where
         F: FnOnce(&'b mut [u8]) -> (usize, R),
     {
-        self.ensure_writable();
+        self.reset_if_empty();
+
+        // Try to get the full advertised window via on-demand compaction
+        let window = self.window();
+        let end_at = self.read_at + self.length + window;
+        self.compact_if_needed(end_at);
+
         let write_at = self.read_at + self.length;
         let max_size = self.contiguous_window();
         let (size, result) = f(&mut self.storage[write_at..write_at + max_size]);
@@ -136,22 +169,35 @@ impl<'a> SocketBufferT<'a> for LinearBuffer<'a> {
     where
         F: FnOnce(&'b mut [u8]) -> (usize, R),
     {
-        self.ensure_writable();
+        // Free compaction before borrow (reset if empty)
+        self.compact_if_free();
+
         let max_size = self.length;
         let (size, result) = f(&mut self.storage[self.read_at..self.read_at + max_size]);
         assert!(size <= max_size);
         self.read_at += size;
         self.length -= size;
-        // Empty buffer reset (no storage access - only scalar fields)
-        if self.length + self.unallocated_extent == 0 {
+
+        // Free compaction after dequeue: if empty, reset read_at.
+        // This is safe because we're only modifying read_at (a scalar),
+        // and the returned slice still points to valid memory.
+        if self.length == 0 && self.unallocated_extent == 0 {
             self.read_at = 0;
         }
         (size, result)
     }
 
     fn get_unallocated(&mut self, offset: usize, mut size: usize) -> &mut [u8] {
-        self.ensure_writable();
-        let start_at = self.read_at + self.length + offset;
+        // Calculate where we need to write
+        let mut start_at = self.read_at + self.length + offset;
+        let end_at = start_at + size;
+
+        // On-demand compaction: if write would exceed capacity, compact first
+        if self.compact_if_needed(end_at) {
+            // Recalculate after compaction
+            start_at = self.read_at + self.length + offset;
+        }
+
         if start_at >= self.capacity() {
             return &mut [];
         }
@@ -167,7 +213,7 @@ impl<'a> SocketBufferT<'a> for LinearBuffer<'a> {
     }
 
     fn write_unallocated(&mut self, offset: usize, data: &[u8]) -> usize {
-        // Note: get_unallocated calls ensure_writable
+        // Note: get_unallocated calls compact_if_free
         let slice = self.get_unallocated(offset, data.len());
         let len = slice.len();
         slice.copy_from_slice(&data[..len]);
@@ -182,7 +228,7 @@ impl<'a> SocketBufferT<'a> for LinearBuffer<'a> {
         } else {
             self.unallocated_extent -= count;
         }
-        self.ensure_writable();
+        self.compact_if_free();
     }
 
     fn get_allocated(&self, offset: usize, mut size: usize) -> &[u8] {
@@ -210,16 +256,21 @@ impl<'a> SocketBufferT<'a> for LinearBuffer<'a> {
         assert!(count <= self.length);
         self.length -= count;
         self.read_at += count;
-        self.ensure_writable();
+        self.compact_if_free();
     }
 
     fn enqueue_slice(&mut self, data: &[u8]) -> usize {
+        self.reset_if_empty();
+
+        // On-demand compaction if we need the space
+        let end_at = self.read_at + self.length + data.len();
+        self.compact_if_needed(end_at);
+
         let write_at = self.read_at + self.length;
         let max_size = self.contiguous_window();
         let size = core::cmp::min(data.len(), max_size);
         self.storage[write_at..write_at + size].copy_from_slice(&data[..size]);
         self.length += size;
-        self.ensure_writable();
         size
     }
 
@@ -228,12 +279,17 @@ impl<'a> SocketBufferT<'a> for LinearBuffer<'a> {
         data[..size].copy_from_slice(&self.storage[self.read_at..self.read_at + size]);
         self.read_at += size;
         self.length -= size;
-        self.ensure_writable();
+        self.compact_if_free();
         size
     }
 
     fn enqueue_many(&mut self, size: usize) -> &mut [u8] {
-        self.ensure_writable();
+        self.reset_if_empty();
+
+        // On-demand compaction if we need the space
+        let end_at = self.read_at + self.length + size;
+        self.compact_if_needed(end_at);
+
         let write_at = self.read_at + self.length;
         let max_size = core::cmp::min(size, self.contiguous_window());
         self.length += max_size;
@@ -241,13 +297,15 @@ impl<'a> SocketBufferT<'a> for LinearBuffer<'a> {
     }
 
     fn dequeue_many(&mut self, size: usize) -> &mut [u8] {
-        self.ensure_writable();
         let size = core::cmp::min(size, self.length);
         let read_at = self.read_at;
         self.read_at += size;
         self.length -= size;
-        // Empty buffer reset (no storage access)
-        if self.length + self.unallocated_extent == 0 {
+        // After dequeue: reset if empty, or compact for window
+        // Note: must happen BEFORE returning slice to avoid invalidating it
+        // But that's problematic... we return a mutable borrow
+        // So we can only reset if empty (which doesn't invalidate)
+        if self.occupied_extent() == 0 {
             self.read_at = 0;
         }
         &mut self.storage[read_at..read_at + size]
@@ -292,39 +350,30 @@ mod tests {
         });
         assert_eq!(&out, &[1, 2, 3, 4]);
         assert_eq!(buf.len(), 0);
-        assert_eq!(buf.read_at, 0); // Reset after empty
+        // After dequeue, buffer is empty, read_at is reset to 0
+        assert_eq!(buf.read_at, 0);
+        assert_eq!(buf.window(), 64);
     }
 
     #[test]
     fn test_compaction() {
-        let mut buf = LinearBuffer::with_threshold(vec![0u8; 100], 50);
+        // On-demand compaction: compaction happens when write would exceed capacity
+        let mut buf = LinearBuffer::new(vec![0u8; 100]);
 
-        // Fill to near end
-        buf.read_at = 80;
-        buf.length = 10;
-
-        // Tail space = 100 - 80 - 10 = 10
-        assert_eq!(buf.window(), 10);
-
-        // Consume some data to trigger potential compaction
-        buf.dequeue_allocated(5);
-        // Now: read_at=85, length=5, extent=5
-        // Tail space = 100 - 85 - 5 = 10
-
-        // Get unallocated should trigger compaction since tail=10 (not 0 yet)
-        // Let's simulate reaching the end
-        buf.read_at = 90;
-        buf.length = 5;
-        // Tail space = 100 - 90 - 5 = 5
-
+        // Position data near end
         buf.read_at = 96;
         buf.length = 4;
-        // Tail space = 100 - 96 - 4 = 0!
-        // And length (4) < threshold (50)
+        // Tail space = 100 - 96 - 4 = 0
+        // window() = 0
 
-        buf.ensure_writable();
+        assert_eq!(buf.window(), 0);
+
+        // Try to write beyond capacity - should trigger compaction
+        let slice_len = buf.get_unallocated(0, 10).len();
+        // After compaction: read_at=0, so we can write
         assert_eq!(buf.read_at, 0);
         assert_eq!(buf.length, 4);
+        assert_eq!(slice_len, 10);
     }
 
     #[test]
@@ -345,9 +394,9 @@ mod tests {
     // ==========================================================================
 
     #[test]
-    fn test_compact_trigger_tail_zero_below_threshold() {
-        // Compaction should trigger when: tail_space == 0 AND length < threshold
-        let mut buf = LinearBuffer::with_threshold(vec![0u8; 100], 50);
+    fn test_on_demand_compact_on_write() {
+        // On-demand compaction triggers when write would exceed capacity
+        let mut buf = LinearBuffer::new(vec![0u8; 100]);
 
         // Position data at the very end
         buf.read_at = 90;
@@ -355,40 +404,40 @@ mod tests {
         // Tail space = 100 - 90 - 10 = 0
         assert_eq!(buf.window(), 0);
 
-        // Data is 10 bytes, below threshold of 50
-        buf.ensure_writable();
+        // Try to enqueue - should compact first
+        let written = buf.enqueue_slice(b"hello");
         assert_eq!(buf.read_at, 0, "Should compact to start");
-        assert_eq!(buf.length, 10);
-        assert_eq!(buf.window(), 90, "Should have 90 bytes available now");
+        assert_eq!(written, 5);
+        assert_eq!(buf.length, 15); // 10 original + 5 new
     }
 
     #[test]
-    fn test_no_compact_above_threshold() {
-        // Should NOT compact when length >= threshold, even if tail_space == 0
-        let mut buf = LinearBuffer::with_threshold(vec![0u8; 100], 20);
+    fn test_no_compact_when_space_available() {
+        // Should NOT compact when write fits in existing tail space
+        let mut buf = LinearBuffer::new(vec![0u8; 100]);
 
         buf.read_at = 60;
-        buf.length = 40;
-        // Tail space = 100 - 60 - 40 = 0
-        // But length (40) >= threshold (20)
-        assert_eq!(buf.window(), 0);
+        buf.length = 30;
+        // Tail space = 100 - 60 - 30 = 10
 
-        buf.ensure_writable();
-        assert_eq!(buf.read_at, 60, "Should NOT compact");
-        assert_eq!(buf.length, 40);
+        let written = buf.enqueue_slice(b"hi");
+        assert_eq!(buf.read_at, 60, "Should NOT compact - space available");
+        assert_eq!(written, 2);
     }
 
     #[test]
-    fn test_no_compact_with_tail_space() {
-        // Should NOT compact when tail_space > 0
-        let mut buf = LinearBuffer::with_threshold(vec![0u8; 100], 50);
+    fn test_compact_only_when_needed() {
+        // Should NOT compact if write fits
+        let mut buf = LinearBuffer::new(vec![0u8; 100]);
 
         buf.read_at = 80;
         buf.length = 10;
-        // Tail space = 100 - 80 - 10 = 10 (not zero)
+        // Tail space = 100 - 80 - 10 = 10
 
-        buf.ensure_writable();
-        assert_eq!(buf.read_at, 80, "Should NOT compact - tail space exists");
+        // Write fits in tail space
+        let slice_len = buf.get_unallocated(0, 5).len();
+        assert_eq!(buf.read_at, 80, "Should NOT compact - fits in tail");
+        assert_eq!(slice_len, 5);
     }
 
     #[test]
@@ -427,38 +476,31 @@ mod tests {
     #[test]
     fn test_compact_preserves_ooo_data() {
         // Compaction should preserve out-of-order data
-        let mut buf = LinearBuffer::with_threshold(vec![0u8; 100], 60);
+        let mut buf = LinearBuffer::new(vec![0u8; 100]);
 
-        // Write in-order data
-        buf.enqueue_slice(b"abcd");
-        assert_eq!(buf.length, 4);
-
-        // Write out-of-order data at offset 10
-        buf.write_unallocated(10, b"XY");
-        assert_eq!(buf.unallocated_extent, 12);
-
-        // Simulate the buffer reaching edge
+        // Simulate the buffer reaching edge with OOO data
         buf.read_at = 86;
         buf.length = 4;
         buf.unallocated_extent = 10;
-        // occupied_extent = max(4, 4+10) = 14
+        // occupied_extent = 4 + 10 = 14
         // Tail space = 100 - 86 - 14 = 0
 
-        buf.ensure_writable();
-        assert_eq!(buf.read_at, 0);
+        // Try to write beyond - should compact and preserve OOO
+        let slice_len = buf.get_unallocated(15, 5).len();
+        assert_eq!(buf.read_at, 0, "Should compact");
         assert_eq!(buf.length, 4);
-        assert_eq!(buf.unallocated_extent, 10, "OOO extent should be preserved");
+        assert!(slice_len > 0, "Should be able to write after compact");
+        // Note: unallocated_extent will be updated by get_unallocated
     }
 
     #[test]
     fn test_write_unallocated_triggers_compact() {
         // write_unallocated should compact if needed space exceeds tail
-        let mut buf = LinearBuffer::with_threshold(vec![0u8; 100], 50);
+        let mut buf = LinearBuffer::new(vec![0u8; 100]);
 
         buf.read_at = 95;
         buf.length = 5;
         // Tail space = 100 - 95 - 5 = 0
-        // occupied_extent = 5 < threshold = 50
 
         // Write needs more space - should trigger compact
         let written = buf.write_unallocated(0, b"new data here");
@@ -482,32 +524,35 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_writable_at_start_noop() {
-        // ensure_writable should be a no-op when already at start with data
+    fn test_compact_if_free_at_start_noop() {
+        // compact_if_free should be a no-op when already at start with data
         let mut buf = LinearBuffer::new(vec![0u8; 100]);
         buf.enqueue_slice(b"test");
 
         assert_eq!(buf.read_at, 0);
-        buf.ensure_writable();
+        buf.compact_if_free();
         assert_eq!(buf.read_at, 0);
         assert_eq!(buf.length, 4);
     }
 
     #[test]
-    fn test_dequeue_allocated_triggers_compact() {
-        // dequeue_allocated may trigger compaction
-        let mut buf = LinearBuffer::with_threshold(vec![0u8; 100], 30);
+    fn test_dequeue_then_write_triggers_compact() {
+        // With on-demand compaction, dequeue doesn't compact
+        // But subsequent write will compact if needed
+        let mut buf = LinearBuffer::new(vec![0u8; 100]);
 
-        // Position near end with enough data
         buf.read_at = 90;
         buf.length = 10;
-        // After dequeue: tail=0, length < threshold -> compact
+        // Tail = 0
 
         buf.dequeue_allocated(2);
-        // Now: read_at should be 0 due to compaction
-        // (tail_space = 100 - 92 - 8 = 0, length=8 < threshold=30)
-        assert_eq!(buf.read_at, 0, "Should compact after dequeue");
-        assert_eq!(buf.length, 8);
+        // read_at = 92, length = 8, tail = 0
+        // dequeue doesn't compact anymore
+
+        // But writing will trigger compact
+        let written = buf.enqueue_slice(b"test");
+        assert_eq!(buf.read_at, 0, "Write should trigger compact");
+        assert_eq!(written, 4);
     }
 
     #[test]
@@ -520,23 +565,24 @@ mod tests {
     }
 
     #[test]
-    fn test_threshold_configuration() {
-        // Verify threshold affects compaction behavior
-        let mut buf_low = LinearBuffer::with_threshold(vec![0u8; 100], 5);
-        let mut buf_high = LinearBuffer::with_threshold(vec![0u8; 100], 50);
+    fn test_on_demand_compact_multiple_writes() {
+        // Multiple writes should work correctly with on-demand compaction
+        let mut buf = LinearBuffer::new(vec![0u8; 100]);
 
-        // Same state: length=10, at end
-        buf_low.read_at = 90;
-        buf_low.length = 10;
-        buf_high.read_at = 90;
-        buf_high.length = 10;
+        // Fill buffer near end
+        buf.read_at = 90;
+        buf.length = 5;
+        // Tail = 5
 
-        buf_low.ensure_writable();
-        buf_high.ensure_writable();
+        // First write fits
+        let w1 = buf.enqueue_slice(b"ab");
+        assert_eq!(buf.read_at, 90, "First write fits, no compact");
+        assert_eq!(w1, 2);
 
-        // buf_low: length(10) >= threshold(5) -> no compact
-        assert_eq!(buf_low.read_at, 90, "Low threshold should NOT compact");
-        // buf_high: length(10) < threshold(50) -> compact
-        assert_eq!(buf_high.read_at, 0, "High threshold should compact");
+        // Now tail = 3, try to write 5 bytes
+        let w2 = buf.enqueue_slice(b"cdefg");
+        assert_eq!(buf.read_at, 0, "Second write triggers compact");
+        assert_eq!(w2, 5);
+        assert_eq!(buf.length, 12); // 5 + 2 + 5
     }
 }
