@@ -148,8 +148,6 @@ pub struct InterfaceInner {
     routes: Routes,
     #[cfg(feature = "multicast")]
     multicast: multicast::State,
-    /// Round-robin index for socket egress to ensure fair scheduling
-    egress_start_index: usize,
 }
 
 /// Configuration structure used for creating a network interface.
@@ -268,7 +266,6 @@ impl Interface {
                 #[cfg(feature = "proto-sixlowpan")]
                 sixlowpan_address_context: Vec::new(),
                 rand,
-                egress_start_index: 0,
             },
         }
     }
@@ -671,25 +668,7 @@ impl Interface {
         }
 
         let mut result = PollResult::None;
-
-        // Collect socket items to enable round-robin scheduling.
-        // This ensures fair processing order across poll cycles, preventing
-        // starvation of later sockets when device buffer fills up.
-        let mut items: heapless::Vec<_, 32> = sockets.items_mut().collect();
-        let socket_count = items.len();
-
-        if socket_count == 0 {
-            return result;
-        }
-
-        // Calculate round-robin starting position and advance for next cycle
-        let start = self.inner.egress_start_index % socket_count;
-        self.inner.egress_start_index = self.inner.egress_start_index.wrapping_add(1);
-
-        // Rotate items so we start from a different socket each cycle
-        items.as_mut_slice()[..].rotate_left(start);
-
-        for item in items {
+        for item in sockets.items_mut() {
             if !item
                 .meta
                 .egress_permitted(self.inner.now, |ip_addr| self.inner.has_neighbor(&ip_addr))
