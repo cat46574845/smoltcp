@@ -54,6 +54,14 @@ impl<'a> LinearBuffer<'a> {
         }
     }
 
+    /// Alias for with_reserve (for backwards compatibility with tokio-dpdk).
+    pub fn with_threshold<S>(storage: S, _threshold: usize) -> Self
+    where
+        S: Into<ManagedSlice<'a, u8>>,
+    {
+        Self::with_reserve(storage, DEFAULT_WINDOW_RESERVE)
+    }
+
 
     /// Return the total occupied extent (allocated + unallocated written data).
     #[inline]
