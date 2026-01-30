@@ -675,7 +675,7 @@ impl Interface {
         // Collect socket items to enable round-robin scheduling.
         // This ensures fair processing order across poll cycles, preventing
         // starvation of later sockets when device buffer fills up.
-        let mut items: heapless::Vec<_, 32> = sockets.items_mut().collect();
+        let mut items: heapless::Vec<_, 128> = sockets.items_mut().collect();
         let socket_count = items.len();
 
         if socket_count == 0 {
