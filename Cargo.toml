@@ -98,7 +98,7 @@ defmt = ["dep:defmt", "heapless/defmt"]
 "async" = []
 
 # Enable latency instrumentation for debugging DPDK scheduling
-"latency-probe" = ["std"]
+"latency-probe" = ["std", "libc"]
 
 default = [
   "std", "log", # needed for `cargo test --no-default-features --features default` :/
