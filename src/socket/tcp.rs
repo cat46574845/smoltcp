@@ -2183,15 +2183,24 @@ impl<'a, B: SocketBufferT<'a>> Socket<'a, B> {
             );
             self.rx_buffer.enqueue_unallocated(contig_len);
 
-            // Record latency probe timestamp when data is enqueued
+            // Record latency probe: TCP rx_buffer enqueue
             #[cfg(feature = "latency-probe")]
-            latency_probe::record_rx_enqueue(contig_len);
+            {
+                let socket_id = self as *const _ as usize;
+                latency_probe::trace_tcp_rx_enqueue(socket_id, contig_len);
+                // 保持舊 API 兼容
+                latency_probe::record_rx_enqueue(contig_len);
+            }
 
             // There's new data in rx_buffer, notify waiting task if any.
             #[cfg(feature = "async")]
             {
                 #[cfg(feature = "latency-probe")]
-                latency_probe::record_waker_wake();
+                {
+                    let socket_id = self as *const _ as usize;
+                    latency_probe::trace_tcp_waker_wake(socket_id);
+                    latency_probe::record_waker_wake();
+                }
                 self.rx_waker.wake();
             }
         }
