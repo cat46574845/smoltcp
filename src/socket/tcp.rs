@@ -2183,21 +2183,29 @@ impl<'a, B: SocketBufferT<'a>> Socket<'a, B> {
             );
             self.rx_buffer.enqueue_unallocated(contig_len);
 
-            // Record latency probe: TCP rx_buffer enqueue (入口點)
-            #[cfg(feature = "latency-probe")]
+            #[cfg(feature = "pkt-debug")]
             {
-                let socket_id = self as *const _ as usize;
-                let buffer_len_after = self.rx_buffer.len();
-                latency_probe::trace_tcp_enqueue(socket_id, contig_len, buffer_len_after);
+                let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+                let ns = ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
+                eprintln!("[SMOLTCP] rx_buffer.enqueue {} bytes at ns={}", contig_len, ns);
             }
+
+            // Record latency probe timestamp when data is enqueued
+            #[cfg(feature = "latency-probe")]
+            latency_probe::record_rx_enqueue(contig_len);
 
             // There's new data in rx_buffer, notify waiting task if any.
             #[cfg(feature = "async")]
             {
                 #[cfg(feature = "latency-probe")]
+                latency_probe::record_waker_wake();
+                #[cfg(feature = "pkt-debug")]
                 {
-                    let socket_id = self as *const _ as usize;
-                    latency_probe::trace_tcp_wake(socket_id);
+                    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+                    let ns = ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
+                    eprintln!("[SMOLTCP] rx_waker.wake() at ns={}", ns);
                 }
                 self.rx_waker.wake();
             }
