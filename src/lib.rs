@@ -175,6 +175,9 @@ pub mod storage;
 pub mod time;
 pub mod wire;
 
+#[cfg(feature = "latency-probe")]
+pub mod latency_probe;
+
 #[cfg(all(
     test,
     any(

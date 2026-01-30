@@ -8,6 +8,9 @@ use core::task::Waker;
 use core::marker::PhantomData;
 use core::{fmt, mem};
 
+#[cfg(feature = "latency-probe")]
+use crate::latency_probe;
+
 #[cfg(feature = "async")]
 use crate::socket::WakerRegistration;
 use crate::socket::{Context, PollAt};
@@ -2180,9 +2183,17 @@ impl<'a, B: SocketBufferT<'a>> Socket<'a, B> {
             );
             self.rx_buffer.enqueue_unallocated(contig_len);
 
+            // Record latency probe timestamp when data is enqueued
+            #[cfg(feature = "latency-probe")]
+            latency_probe::record_rx_enqueue(contig_len);
+
             // There's new data in rx_buffer, notify waiting task if any.
             #[cfg(feature = "async")]
-            self.rx_waker.wake();
+            {
+                #[cfg(feature = "latency-probe")]
+                latency_probe::record_waker_wake();
+                self.rx_waker.wake();
+            }
         }
 
         if !self.assembler.is_empty() {
