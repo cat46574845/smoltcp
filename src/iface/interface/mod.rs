@@ -51,6 +51,9 @@ use crate::time::{Duration, Instant};
 
 use crate::wire::*;
 
+#[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+use alloc::collections::BTreeMap;
+
 macro_rules! check {
     ($e:expr) => {
         match $e {
@@ -150,6 +153,29 @@ pub struct InterfaceInner {
     multicast: multicast::State,
     /// Round-robin index for socket egress to ensure fair scheduling
     egress_start_index: usize,
+    #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+    tcp_flow_cache: BTreeMap<TcpFlowKey, super::socket_set::SocketHandle>,
+}
+
+#[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct TcpFlowKey {
+    local_addr: IpAddress,
+    local_port: u16,
+    remote_addr: IpAddress,
+    remote_port: u16,
+}
+
+#[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+impl TcpFlowKey {
+    pub(crate) fn from_incoming(ip_repr: &IpRepr, tcp_repr: &TcpRepr<'_>) -> Self {
+        Self {
+            local_addr: ip_repr.dst_addr(),
+            local_port: tcp_repr.dst_port,
+            remote_addr: ip_repr.src_addr(),
+            remote_port: tcp_repr.src_port,
+        }
+    }
 }
 
 /// Configuration structure used for creating a network interface.
@@ -269,6 +295,8 @@ impl Interface {
                 sixlowpan_address_context: Vec::new(),
                 rand,
                 egress_start_index: 0,
+                #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+                tcp_flow_cache: BTreeMap::new(),
             },
         }
     }
@@ -672,11 +700,7 @@ impl Interface {
 
         let mut result = PollResult::None;
 
-        // Collect socket items to enable round-robin scheduling.
-        // This ensures fair processing order across poll cycles, preventing
-        // starvation of later sockets when device buffer fills up.
-        let mut items: heapless::Vec<_, 128> = sockets.items_mut().collect();
-        let socket_count = items.len();
+        let socket_count = sockets.storage_len();
 
         if socket_count == 0 {
             return result;
@@ -686,10 +710,12 @@ impl Interface {
         let start = self.inner.egress_start_index % socket_count;
         self.inner.egress_start_index = self.inner.egress_start_index.wrapping_add(1);
 
-        // Rotate items so we start from a different socket each cycle
-        items.as_mut_slice()[..].rotate_left(start);
+        for offset in 0..socket_count {
+            let index = (start + offset) % socket_count;
+            let Some(item) = sockets.item_mut_at(index) else {
+                continue;
+            };
 
-        for item in items {
             if !item
                 .meta
                 .egress_permitted(self.inner.now, |ip_addr| self.inner.has_neighbor(&ip_addr))

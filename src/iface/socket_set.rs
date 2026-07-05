@@ -45,6 +45,12 @@ impl fmt::Display for SocketHandle {
     }
 }
 
+impl SocketHandle {
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+}
+
 /// An extensible set of sockets.
 ///
 /// The lifetime `'a` is used when storing a `Socket<'a>`.  If you're using
@@ -161,5 +167,16 @@ impl<'a, B: SocketBufferT<'a>> SocketSet<'a, B> {
     pub(crate) fn items_mut(&mut self) -> impl Iterator<Item = &mut Item<'a, B>> + '_ {
         self.sockets.iter_mut().filter_map(|x| x.inner.as_mut())
     }
-}
 
+    /// Return the number of backing storage slots.
+    pub(crate) fn storage_len(&self) -> usize {
+        self.sockets.len()
+    }
+
+    /// Get a socket item by backing storage slot.
+    pub(crate) fn item_mut_at(&mut self, index: usize) -> Option<&mut Item<'a, B>> {
+        self.sockets
+            .get_mut(index)
+            .and_then(|slot| slot.inner.as_mut())
+    }
+}
