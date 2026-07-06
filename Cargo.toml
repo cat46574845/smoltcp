@@ -100,6 +100,9 @@ defmt = ["dep:defmt", "heapless/defmt"]
 # Enable latency instrumentation for debugging DPDK scheduling
 "latency-probe" = ["std", "libc"]
 
+# Lightweight counters consumed by the outer market-path trace writer.
+"market-trace" = []
+
 # Enable packet-level debug output
 "pkt-debug" = ["std", "libc"]
 
