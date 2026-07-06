@@ -510,7 +510,7 @@ impl Interface {
 
         // Process ingress while there's packets available.
         loop {
-            match self.socket_ingress(device, sockets) {
+            match self.socket_ingress_touched(device, sockets, |_| {}) {
                 PollIngressSingleResult::None => break,
                 PollIngressSingleResult::PacketProcessed => {}
                 PollIngressSingleResult::SocketStateChanged => res = PollResult::SocketStateChanged,
@@ -558,36 +558,7 @@ impl Interface {
         #[cfg(feature = "multicast")]
         self.multicast_egress(device);
 
-        self.socket_egress_with_poll_at(device, sockets, |_, _| {}).0
-    }
-
-    /// Transmit packets queued in the sockets and report each scanned socket's next egress deadline.
-    pub fn poll_egress_with_poll_at<'s, B: SocketBufferT<'s>>(
-        &mut self,
-        timestamp: Instant,
-        device: &mut (impl Device + ?Sized),
-        sockets: &mut SocketSet<'s, B>,
-        on_poll_at: impl FnMut(SocketHandle, Instant),
-    ) -> (PollResult, bool) {
-        self.inner.now = timestamp;
-
-        match self.inner.caps.medium {
-            #[cfg(feature = "medium-ieee802154")]
-            Medium::Ieee802154 => {
-                #[cfg(feature = "proto-sixlowpan-fragmentation")]
-                self.sixlowpan_egress(device);
-            }
-            #[cfg(any(feature = "medium-ethernet", feature = "medium-ip"))]
-            _ => {
-                #[cfg(feature = "proto-ipv4-fragmentation")]
-                self.ipv4_egress(device);
-            }
-        }
-
-        #[cfg(feature = "multicast")]
-        self.multicast_egress(device);
-
-        self.socket_egress_with_poll_at(device, sockets, on_poll_at)
+        self.socket_egress(device, sockets)
     }
 
     /// Transmit packets queued in one socket.
@@ -636,12 +607,23 @@ impl Interface {
         device: &mut (impl Device + ?Sized),
         sockets: &mut SocketSet<'s, B>,
     ) -> PollIngressSingleResult {
+        self.poll_ingress_single_touched(timestamp, device, sockets, |_| {})
+    }
+
+    /// Process one incoming packet queued in the device and report sockets touched by ingress.
+    pub fn poll_ingress_single_touched<'s, B: SocketBufferT<'s>>(
+        &mut self,
+        timestamp: Instant,
+        device: &mut (impl Device + ?Sized),
+        sockets: &mut SocketSet<'s, B>,
+        on_touched: impl FnMut(SocketHandle),
+    ) -> PollIngressSingleResult {
         self.inner.now = timestamp;
 
         #[cfg(feature = "_proto-fragmentation")]
         self.fragments.assembler.remove_expired(timestamp);
 
-        self.socket_ingress(device, sockets)
+        self.socket_ingress_touched(device, sockets, on_touched)
     }
 
     /// Return a _soft deadline_ for calling [poll] the next time.
@@ -723,10 +705,11 @@ impl Interface {
         }
     }
 
-    fn socket_ingress<'s, B: SocketBufferT<'s>>(
+    fn socket_ingress_touched<'s, B: SocketBufferT<'s>>(
         &mut self,
         device: &mut (impl Device + ?Sized),
         sockets: &mut SocketSet<'s, B>,
+        mut on_touched: impl FnMut(SocketHandle),
     ) -> PollIngressSingleResult {
         let Some((rx_token, tx_token)) = device.receive(self.inner.now) else {
             return PollIngressSingleResult::None;
@@ -741,9 +724,13 @@ impl Interface {
             match self.inner.caps.medium {
                 #[cfg(feature = "medium-ethernet")]
                 Medium::Ethernet => {
-                    if let Some(packet) =
-                        self.inner
-                            .process_ethernet(sockets, rx_meta, frame, &mut self.fragments)
+                    if let Some(packet) = self.inner.process_ethernet_touched(
+                        sockets,
+                        rx_meta,
+                        frame,
+                        &mut self.fragments,
+                        &mut on_touched,
+                    )
                     {
                         if let Err(err) =
                             self.inner.dispatch(tx_token, packet, &mut self.fragmenter)
@@ -754,9 +741,13 @@ impl Interface {
                 }
                 #[cfg(feature = "medium-ip")]
                 Medium::Ip => {
-                    if let Some(packet) =
-                        self.inner
-                            .process_ip(sockets, rx_meta, frame, &mut self.fragments)
+                    if let Some(packet) = self.inner.process_ip_touched(
+                        sockets,
+                        rx_meta,
+                        frame,
+                        &mut self.fragments,
+                        &mut on_touched,
+                    )
                     {
                         if let Err(err) = self.inner.dispatch_ip(
                             tx_token,
@@ -796,19 +787,17 @@ impl Interface {
         })
     }
 
-    fn socket_egress_with_poll_at<'s, B: SocketBufferT<'s>>(
+    fn socket_egress<'s, B: SocketBufferT<'s>>(
         &mut self,
         device: &mut (impl Device + ?Sized),
         sockets: &mut SocketSet<'s, B>,
-        mut on_poll_at: impl FnMut(SocketHandle, Instant),
-    ) -> (PollResult, bool) {
+    ) -> PollResult {
         let mut result = PollResult::None;
-        let mut exhausted = false;
 
         let socket_count = sockets.storage_len();
 
         if socket_count == 0 {
-            return (result, exhausted);
+            return result;
         }
 
         // Calculate round-robin starting position and advance for next cycle
@@ -817,20 +806,13 @@ impl Interface {
 
         for offset in 0..socket_count {
             let index = (start + offset) % socket_count;
-            let outcome = self.socket_egress_index(device, sockets, index);
-            if let Some(next_due) = self.poll_at_index(sockets, index) {
-                on_poll_at(SocketHandle::from_index(index), next_due);
-            }
-            match outcome {
+            match self.socket_egress_index(device, sockets, index) {
                 SocketEgressOutcome::Changed => result = PollResult::SocketStateChanged,
-                SocketEgressOutcome::Exhausted => {
-                    exhausted = true;
-                    break;
-                }
+                SocketEgressOutcome::Exhausted => break,
                 SocketEgressOutcome::None => {}
             }
         }
-        (result, exhausted)
+        result
     }
 
     fn socket_egress_index<'s, B: SocketBufferT<'s>>(
@@ -1037,6 +1019,7 @@ impl InterfaceInner {
     }
 
     #[cfg(feature = "medium-ip")]
+    #[allow(dead_code)]
     fn process_ip<'frame, 's, B: SocketBufferT<'s>>(
         &mut self,
         sockets: &mut SocketSet<'s, B>,
@@ -1044,16 +1027,40 @@ impl InterfaceInner {
         ip_payload: &'frame [u8],
         frag: &'frame mut FragmentsBuffer,
     ) -> Option<Packet<'frame>> {
+        self.process_ip_touched(sockets, meta, ip_payload, frag, &mut |_| {})
+    }
+
+    fn process_ip_touched<'frame, 's, B: SocketBufferT<'s>>(
+        &mut self,
+        sockets: &mut SocketSet<'s, B>,
+        meta: PacketMeta,
+        ip_payload: &'frame [u8],
+        frag: &'frame mut FragmentsBuffer,
+        on_touched: &mut impl FnMut(SocketHandle),
+    ) -> Option<Packet<'frame>> {
         match IpVersion::of_packet(ip_payload) {
             #[cfg(feature = "proto-ipv4")]
             Ok(IpVersion::Ipv4) => {
                 let ipv4_packet = check!(Ipv4Packet::new_checked(ip_payload));
-                self.process_ipv4(sockets, meta, HardwareAddress::Ip, &ipv4_packet, frag)
+                self.process_ipv4_touched(
+                    sockets,
+                    meta,
+                    HardwareAddress::Ip,
+                    &ipv4_packet,
+                    frag,
+                    on_touched,
+                )
             }
             #[cfg(feature = "proto-ipv6")]
             Ok(IpVersion::Ipv6) => {
                 let ipv6_packet = check!(Ipv6Packet::new_checked(ip_payload));
-                self.process_ipv6(sockets, meta, HardwareAddress::Ip, &ipv6_packet)
+                self.process_ipv6_touched(
+                    sockets,
+                    meta,
+                    HardwareAddress::Ip,
+                    &ipv6_packet,
+                    on_touched,
+                )
             }
             // Drop all other traffic.
             _ => None,

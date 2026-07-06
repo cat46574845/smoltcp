@@ -1,12 +1,30 @@
 use super::*;
 
 impl InterfaceInner {
+    #[allow(dead_code)]
     pub(crate) fn process_tcp<'frame, 's, B: SocketBufferT<'s>>(
         &mut self,
         sockets: &mut SocketSet<'s, B>,
         handled_by_raw_socket: bool,
         ip_repr: IpRepr,
         ip_payload: &'frame [u8],
+    ) -> Option<Packet<'frame>> {
+        self.process_tcp_touched(
+            sockets,
+            handled_by_raw_socket,
+            ip_repr,
+            ip_payload,
+            &mut |_| {},
+        )
+    }
+
+    pub(crate) fn process_tcp_touched<'frame, 's, B: SocketBufferT<'s>>(
+        &mut self,
+        sockets: &mut SocketSet<'s, B>,
+        handled_by_raw_socket: bool,
+        ip_repr: IpRepr,
+        ip_payload: &'frame [u8],
+        on_touched: &mut impl FnMut(SocketHandle),
     ) -> Option<Packet<'frame>> {
         let (src_addr, dst_addr) = (ip_repr.src_addr(), ip_repr.dst_addr());
         let tcp_packet = check!(TcpPacket::new_checked(ip_payload));
@@ -24,6 +42,7 @@ impl InterfaceInner {
                 let cached = sockets.item_mut_at(handle.index()).and_then(|item| {
                     if let crate::socket::Socket::Tcp(ref mut tcp_socket) = item.socket {
                         if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
+                            on_touched(item.meta.handle);
                             let packet = tcp_socket
                                 .process(self, &ip_repr, &tcp_repr)
                                 .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
@@ -50,6 +69,7 @@ impl InterfaceInner {
         for item in sockets.items_mut() {
             if let crate::socket::Socket::Tcp(ref mut tcp_socket) = item.socket {
                 if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
+                    on_touched(item.meta.handle);
                     let packet = tcp_socket
                         .process(self, &ip_repr, &tcp_repr)
                         .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));

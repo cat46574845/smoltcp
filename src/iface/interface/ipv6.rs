@@ -185,12 +185,24 @@ impl InterfaceInner {
         })
     }
 
+    #[allow(dead_code)]
     pub(super) fn process_ipv6<'frame, 's, B: SocketBufferT<'s>>(
         &mut self,
         sockets: &mut SocketSet<'s, B>,
         meta: PacketMeta,
         source_hardware_addr: HardwareAddress,
         ipv6_packet: &Ipv6Packet<&'frame [u8]>,
+    ) -> Option<Packet<'frame>> {
+        self.process_ipv6_touched(sockets, meta, source_hardware_addr, ipv6_packet, &mut |_| {})
+    }
+
+    pub(super) fn process_ipv6_touched<'frame, 's, B: SocketBufferT<'s>>(
+        &mut self,
+        sockets: &mut SocketSet<'s, B>,
+        meta: PacketMeta,
+        source_hardware_addr: HardwareAddress,
+        ipv6_packet: &Ipv6Packet<&'frame [u8]>,
+        on_touched: &mut impl FnMut(SocketHandle),
     ) -> Option<Packet<'frame>> {
         let ipv6_repr = check!(Ipv6Repr::parse(ipv6_packet));
 
@@ -251,13 +263,14 @@ impl InterfaceInner {
             );
         }
 
-        self.process_nxt_hdr(
+        self.process_nxt_hdr_touched(
             sockets,
             meta,
             ipv6_repr,
             next_header,
             handled_by_raw_socket,
             ip_payload,
+            on_touched,
         )
     }
 
@@ -321,6 +334,7 @@ impl InterfaceInner {
 
     /// Given the next header value forward the payload onto the correct process
     /// function.
+    #[allow(dead_code)]
     fn process_nxt_hdr<'frame, 's, B: SocketBufferT<'s>>(
         &mut self,
         sockets: &mut SocketSet<'s, B>,
@@ -330,21 +344,49 @@ impl InterfaceInner {
         handled_by_raw_socket: bool,
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
+        self.process_nxt_hdr_touched(
+            sockets,
+            meta,
+            ipv6_repr,
+            nxt_hdr,
+            handled_by_raw_socket,
+            ip_payload,
+            &mut |_| {},
+        )
+    }
+
+    fn process_nxt_hdr_touched<'frame, 's, B: SocketBufferT<'s>>(
+        &mut self,
+        sockets: &mut SocketSet<'s, B>,
+        meta: PacketMeta,
+        ipv6_repr: Ipv6Repr,
+        nxt_hdr: IpProtocol,
+        handled_by_raw_socket: bool,
+        ip_payload: &'frame [u8],
+        on_touched: &mut impl FnMut(SocketHandle),
+    ) -> Option<Packet<'frame>> {
         match nxt_hdr {
             IpProtocol::Icmpv6 => self.process_icmpv6(sockets, ipv6_repr, ip_payload),
 
             #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
-            IpProtocol::Udp => self.process_udp(
+            IpProtocol::Udp => self.process_udp_touched(
                 sockets,
                 meta,
                 handled_by_raw_socket,
                 ipv6_repr.into(),
                 ip_payload,
+                on_touched,
             ),
 
             #[cfg(feature = "socket-tcp")]
             IpProtocol::Tcp => {
-                self.process_tcp(sockets, handled_by_raw_socket, ipv6_repr.into(), ip_payload)
+                self.process_tcp_touched(
+                    sockets,
+                    handled_by_raw_socket,
+                    ipv6_repr.into(),
+                    ip_payload,
+                    on_touched,
+                )
             }
 
             #[cfg(feature = "socket-raw")]

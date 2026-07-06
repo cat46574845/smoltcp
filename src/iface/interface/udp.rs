@@ -7,6 +7,7 @@ use crate::socket::dns::Socket as DnsSocket;
 use crate::socket::udp::Socket as UdpSocket;
 
 impl InterfaceInner {
+    #[allow(dead_code)]
     pub(super) fn process_udp<'frame, 's, B: SocketBufferT<'s>>(
         &mut self,
         sockets: &mut SocketSet<'s, B>,
@@ -14,6 +15,25 @@ impl InterfaceInner {
         handled_by_raw_socket: bool,
         ip_repr: IpRepr,
         ip_payload: &'frame [u8],
+    ) -> Option<Packet<'frame>> {
+        self.process_udp_touched(
+            sockets,
+            meta,
+            handled_by_raw_socket,
+            ip_repr,
+            ip_payload,
+            &mut |_| {},
+        )
+    }
+
+    pub(super) fn process_udp_touched<'frame, 's, B: SocketBufferT<'s>>(
+        &mut self,
+        sockets: &mut SocketSet<'s, B>,
+        meta: PacketMeta,
+        handled_by_raw_socket: bool,
+        ip_repr: IpRepr,
+        ip_payload: &'frame [u8],
+        on_touched: &mut impl FnMut(SocketHandle),
     ) -> Option<Packet<'frame>> {
         let (src_addr, dst_addr) = (ip_repr.src_addr(), ip_repr.dst_addr());
         let udp_packet = check!(UdpPacket::new_checked(ip_payload));
@@ -25,24 +45,24 @@ impl InterfaceInner {
         ));
 
         #[cfg(feature = "socket-udp")]
-        for udp_socket in sockets
-            .items_mut()
-            .filter_map(|i| UdpSocket::downcast_mut(&mut i.socket))
-        {
-            if udp_socket.accepts(self, &ip_repr, &udp_repr) {
-                udp_socket.process(self, meta, &ip_repr, &udp_repr, udp_packet.payload());
-                return None;
+        for item in sockets.items_mut() {
+            if let Some(udp_socket) = UdpSocket::downcast_mut(&mut item.socket) {
+                if udp_socket.accepts(self, &ip_repr, &udp_repr) {
+                    on_touched(item.meta.handle);
+                    udp_socket.process(self, meta, &ip_repr, &udp_repr, udp_packet.payload());
+                    return None;
+                }
             }
         }
 
         #[cfg(feature = "socket-dns")]
-        for dns_socket in sockets
-            .items_mut()
-            .filter_map(|i| DnsSocket::downcast_mut(&mut i.socket))
-        {
-            if dns_socket.accepts(&ip_repr, &udp_repr) {
-                dns_socket.process(self, &ip_repr, &udp_repr, udp_packet.payload());
-                return None;
+        for item in sockets.items_mut() {
+            if let Some(dns_socket) = DnsSocket::downcast_mut(&mut item.socket) {
+                if dns_socket.accepts(&ip_repr, &udp_repr) {
+                    on_touched(item.meta.handle);
+                    dns_socket.process(self, &ip_repr, &udp_repr, udp_packet.payload());
+                    return None;
+                }
             }
         }
 

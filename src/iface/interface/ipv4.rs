@@ -92,6 +92,7 @@ impl InterfaceInner {
         })
     }
 
+    #[allow(dead_code)]
     pub(super) fn process_ipv4<'a, 's, B: SocketBufferT<'s>>(
         &mut self,
         sockets: &mut SocketSet<'s, B>,
@@ -99,6 +100,25 @@ impl InterfaceInner {
         source_hardware_addr: HardwareAddress,
         ipv4_packet: &Ipv4Packet<&'a [u8]>,
         #[allow(unused_variables)] frag: &'a mut FragmentsBuffer,
+    ) -> Option<Packet<'a>> {
+        self.process_ipv4_touched(
+            sockets,
+            meta,
+            source_hardware_addr,
+            ipv4_packet,
+            frag,
+            &mut |_| {},
+        )
+    }
+
+    pub(super) fn process_ipv4_touched<'a, 's, B: SocketBufferT<'s>>(
+        &mut self,
+        sockets: &mut SocketSet<'s, B>,
+        meta: PacketMeta,
+        source_hardware_addr: HardwareAddress,
+        ipv4_packet: &Ipv4Packet<&'a [u8]>,
+        #[allow(unused_variables)] frag: &'a mut FragmentsBuffer,
+        on_touched: &mut impl FnMut(SocketHandle),
     ) -> Option<Packet<'a>> {
         let ipv4_repr = check!(Ipv4Repr::parse(ipv4_packet, &self.caps.checksum));
         if !self.is_unicast_v4(ipv4_repr.src_addr) && !ipv4_repr.src_addr.is_unspecified() {
@@ -230,12 +250,25 @@ impl InterfaceInner {
 
             #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
             IpProtocol::Udp => {
-                self.process_udp(sockets, meta, handled_by_raw_socket, ip_repr, ip_payload)
+                self.process_udp_touched(
+                    sockets,
+                    meta,
+                    handled_by_raw_socket,
+                    ip_repr,
+                    ip_payload,
+                    on_touched,
+                )
             }
 
             #[cfg(feature = "socket-tcp")]
             IpProtocol::Tcp => {
-                self.process_tcp(sockets, handled_by_raw_socket, ip_repr, ip_payload)
+                self.process_tcp_touched(
+                    sockets,
+                    handled_by_raw_socket,
+                    ip_repr,
+                    ip_payload,
+                    on_touched,
+                )
             }
 
             _ if handled_by_raw_socket => None,

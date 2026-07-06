@@ -1,12 +1,24 @@
 use super::*;
 
 impl InterfaceInner {
+    #[allow(dead_code)]
     pub(super) fn process_ethernet<'frame, 's, B: SocketBufferT<'s>>(
         &mut self,
         sockets: &mut SocketSet<'s, B>,
         meta: crate::phy::PacketMeta,
         frame: &'frame [u8],
         fragments: &'frame mut FragmentsBuffer,
+    ) -> Option<EthernetPacket<'frame>> {
+        self.process_ethernet_touched(sockets, meta, frame, fragments, &mut |_| {})
+    }
+
+    pub(super) fn process_ethernet_touched<'frame, 's, B: SocketBufferT<'s>>(
+        &mut self,
+        sockets: &mut SocketSet<'s, B>,
+        meta: crate::phy::PacketMeta,
+        frame: &'frame [u8],
+        fragments: &'frame mut FragmentsBuffer,
+        on_touched: &mut impl FnMut(SocketHandle),
     ) -> Option<EthernetPacket<'frame>> {
         let eth_frame = check!(EthernetFrame::new_checked(frame));
 
@@ -25,19 +37,26 @@ impl InterfaceInner {
             EthernetProtocol::Ipv4 => {
                 let ipv4_packet = check!(Ipv4Packet::new_checked(eth_frame.payload()));
 
-                self.process_ipv4(
+                self.process_ipv4_touched(
                     sockets,
                     meta,
                     eth_frame.src_addr().into(),
                     &ipv4_packet,
                     fragments,
+                    on_touched,
                 )
                 .map(EthernetPacket::Ip)
             }
             #[cfg(feature = "proto-ipv6")]
             EthernetProtocol::Ipv6 => {
                 let ipv6_packet = check!(Ipv6Packet::new_checked(eth_frame.payload()));
-                self.process_ipv6(sockets, meta, eth_frame.src_addr().into(), &ipv6_packet)
+                self.process_ipv6_touched(
+                    sockets,
+                    meta,
+                    eth_frame.src_addr().into(),
+                    &ipv6_packet,
+                    on_touched,
+                )
                     .map(EthernetPacket::Ip)
             }
             // Drop all other traffic.
