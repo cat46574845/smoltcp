@@ -42,7 +42,7 @@ impl InterfaceInner {
                 let cached = sockets.item_mut_at(handle.index()).and_then(|item| {
                     if let crate::socket::Socket::Tcp(ref mut tcp_socket) = item.socket {
                         if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
-                            #[cfg(feature = "latency-probe")]
+                            #[cfg(any(feature = "latency-probe", feature = "market-trace"))]
                             self.record_tcp_probe_cache_hit();
                             on_touched(item.meta.handle);
                             let packet = tcp_socket
@@ -64,18 +64,18 @@ impl InterfaceInner {
                     return packet;
                 }
 
-                #[cfg(feature = "latency-probe")]
+                #[cfg(any(feature = "latency-probe", feature = "market-trace"))]
                 self.record_tcp_probe_cache_miss();
                 self.tcp_flow_cache.remove(&key);
             } else {
-                #[cfg(feature = "latency-probe")]
+                #[cfg(any(feature = "latency-probe", feature = "market-trace"))]
                 self.record_tcp_probe_cache_miss();
             }
         }
 
         for item in sockets.items_mut() {
             if let crate::socket::Socket::Tcp(ref mut tcp_socket) = item.socket {
-                #[cfg(all(feature = "latency-probe", feature = "alloc"))]
+                #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc"))]
                 self.record_tcp_probe_linear_scan();
                 if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
                     on_touched(item.meta.handle);

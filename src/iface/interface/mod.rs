@@ -174,15 +174,15 @@ pub struct InterfaceInner {
     egress_start_index: usize,
     #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
     tcp_flow_cache: BTreeMap<TcpFlowKey, super::socket_set::SocketHandle>,
-    #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+    #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
     tcp_probe_cache_hits: usize,
-    #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+    #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
     tcp_probe_cache_misses: usize,
-    #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+    #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
     tcp_probe_linear_scanned: usize,
 }
 
-#[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+#[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TcpProbeStats {
     pub cache_hits: usize,
@@ -330,11 +330,11 @@ impl Interface {
                 egress_start_index: 0,
                 #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
                 tcp_flow_cache: BTreeMap::new(),
-                #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+                #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
                 tcp_probe_cache_hits: 0,
-                #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+                #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
                 tcp_probe_cache_misses: 0,
-                #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+                #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
                 tcp_probe_linear_scanned: 0,
             },
         }
@@ -347,7 +347,7 @@ impl Interface {
         &mut self.inner
     }
 
-    #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+    #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
     pub fn take_tcp_probe_stats(&mut self) -> TcpProbeStats {
         self.inner.take_tcp_probe_stats()
     }
@@ -957,22 +957,22 @@ impl Interface {
 }
 
 impl InterfaceInner {
-    #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+    #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
     pub(crate) fn record_tcp_probe_cache_hit(&mut self) {
         self.tcp_probe_cache_hits = self.tcp_probe_cache_hits.saturating_add(1);
     }
 
-    #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+    #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
     pub(crate) fn record_tcp_probe_cache_miss(&mut self) {
         self.tcp_probe_cache_misses = self.tcp_probe_cache_misses.saturating_add(1);
     }
 
-    #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+    #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
     pub(crate) fn record_tcp_probe_linear_scan(&mut self) {
         self.tcp_probe_linear_scanned = self.tcp_probe_linear_scanned.saturating_add(1);
     }
 
-    #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+    #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
     pub(crate) fn take_tcp_probe_stats(&mut self) -> TcpProbeStats {
         let stats = TcpProbeStats {
             cache_hits: self.tcp_probe_cache_hits,
