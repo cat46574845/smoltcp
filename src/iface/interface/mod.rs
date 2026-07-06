@@ -1030,6 +1030,7 @@ impl InterfaceInner {
         self.process_ip_touched(sockets, meta, ip_payload, frag, &mut |_| {})
     }
 
+    #[cfg(feature = "medium-ip")]
     fn process_ip_touched<'frame, 's, B: SocketBufferT<'s>>(
         &mut self,
         sockets: &mut SocketSet<'s, B>,
