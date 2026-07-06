@@ -558,7 +558,36 @@ impl Interface {
         #[cfg(feature = "multicast")]
         self.multicast_egress(device);
 
-        self.socket_egress(device, sockets)
+        self.socket_egress_with_poll_at(device, sockets, |_, _| {}).0
+    }
+
+    /// Transmit packets queued in the sockets and report each scanned socket's next egress deadline.
+    pub fn poll_egress_with_poll_at<'s, B: SocketBufferT<'s>>(
+        &mut self,
+        timestamp: Instant,
+        device: &mut (impl Device + ?Sized),
+        sockets: &mut SocketSet<'s, B>,
+        on_poll_at: impl FnMut(SocketHandle, Instant),
+    ) -> (PollResult, bool) {
+        self.inner.now = timestamp;
+
+        match self.inner.caps.medium {
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => {
+                #[cfg(feature = "proto-sixlowpan-fragmentation")]
+                self.sixlowpan_egress(device);
+            }
+            #[cfg(any(feature = "medium-ethernet", feature = "medium-ip"))]
+            _ => {
+                #[cfg(feature = "proto-ipv4-fragmentation")]
+                self.ipv4_egress(device);
+            }
+        }
+
+        #[cfg(feature = "multicast")]
+        self.multicast_egress(device);
+
+        self.socket_egress_with_poll_at(device, sockets, on_poll_at)
     }
 
     /// Transmit packets queued in one socket.
@@ -657,8 +686,16 @@ impl Interface {
         handle: SocketHandle,
     ) -> Option<Instant> {
         self.inner.now = timestamp;
+        self.poll_at_index(sockets, handle.index())
+    }
+
+    fn poll_at_index<'s, B: SocketBufferT<'s>>(
+        &mut self,
+        sockets: &SocketSet<'s, B>,
+        index: usize,
+    ) -> Option<Instant> {
         let inner = &mut self.inner;
-        let item = sockets.item_at(handle.index())?;
+        let item = sockets.item_at(index)?;
         let socket_poll_at = item.socket.poll_at(inner);
         match item
             .meta
@@ -759,17 +796,19 @@ impl Interface {
         })
     }
 
-    fn socket_egress<'s, B: SocketBufferT<'s>>(
+    fn socket_egress_with_poll_at<'s, B: SocketBufferT<'s>>(
         &mut self,
         device: &mut (impl Device + ?Sized),
         sockets: &mut SocketSet<'s, B>,
-    ) -> PollResult {
+        mut on_poll_at: impl FnMut(SocketHandle, Instant),
+    ) -> (PollResult, bool) {
         let mut result = PollResult::None;
+        let mut exhausted = false;
 
         let socket_count = sockets.storage_len();
 
         if socket_count == 0 {
-            return result;
+            return (result, exhausted);
         }
 
         // Calculate round-robin starting position and advance for next cycle
@@ -778,13 +817,20 @@ impl Interface {
 
         for offset in 0..socket_count {
             let index = (start + offset) % socket_count;
-            match self.socket_egress_index(device, sockets, index) {
+            let outcome = self.socket_egress_index(device, sockets, index);
+            if let Some(next_due) = self.poll_at_index(sockets, index) {
+                on_poll_at(SocketHandle::from_index(index), next_due);
+            }
+            match outcome {
                 SocketEgressOutcome::Changed => result = PollResult::SocketStateChanged,
-                SocketEgressOutcome::Exhausted => break,
+                SocketEgressOutcome::Exhausted => {
+                    exhausted = true;
+                    break;
+                }
                 SocketEgressOutcome::None => {}
             }
         }
-        result
+        (result, exhausted)
     }
 
     fn socket_egress_index<'s, B: SocketBufferT<'s>>(
