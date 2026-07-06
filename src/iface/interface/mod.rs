@@ -37,7 +37,7 @@ use super::fragmentation::{Fragmenter, FragmentsBuffer};
 
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use super::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache};
-use super::socket_set::SocketSet;
+use super::socket_set::{SocketHandle, SocketSet};
 #[cfg(feature = "proto-sixlowpan")]
 use crate::config::IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT;
 use crate::config::IFACE_MAX_ADDR_COUNT;
@@ -107,6 +107,25 @@ pub enum PollIngressSingleResult {
     ///
     /// You should check the state of sockets again for received data or completion of operations.
     SocketStateChanged,
+}
+
+/// Result returned by [`Interface::poll_egress_handle`].
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum PollEgressHandleResult {
+    /// No packet was transmitted.
+    None,
+    /// A packet was transmitted and socket state may have changed.
+    SocketStateChanged,
+    /// The device transmit path had no token available.
+    DeviceExhausted,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum SocketEgressOutcome {
+    None,
+    Changed,
+    Exhausted,
 }
 
 /// A  network interface.
@@ -542,6 +561,39 @@ impl Interface {
         self.socket_egress(device, sockets)
     }
 
+    /// Transmit packets queued in one socket.
+    pub fn poll_egress_handle<'s, B: SocketBufferT<'s>>(
+        &mut self,
+        timestamp: Instant,
+        device: &mut (impl Device + ?Sized),
+        sockets: &mut SocketSet<'s, B>,
+        handle: SocketHandle,
+    ) -> PollEgressHandleResult {
+        self.inner.now = timestamp;
+
+        match self.inner.caps.medium {
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => {
+                #[cfg(feature = "proto-sixlowpan-fragmentation")]
+                self.sixlowpan_egress(device);
+            }
+            #[cfg(any(feature = "medium-ethernet", feature = "medium-ip"))]
+            _ => {
+                #[cfg(feature = "proto-ipv4-fragmentation")]
+                self.ipv4_egress(device);
+            }
+        }
+
+        #[cfg(feature = "multicast")]
+        self.multicast_egress(device);
+
+        match self.socket_egress_index(device, sockets, handle.index()) {
+            SocketEgressOutcome::Changed => PollEgressHandleResult::SocketStateChanged,
+            SocketEgressOutcome::None => PollEgressHandleResult::None,
+            SocketEgressOutcome::Exhausted => PollEgressHandleResult::DeviceExhausted,
+        }
+    }
+
     /// Process one incoming packet queued in the device.
     ///
     /// Returns a value indicating:
@@ -595,6 +647,27 @@ impl Interface {
                 }
             })
             .min()
+    }
+
+    /// Return the next egress poll timestamp for one socket.
+    pub fn poll_at_handle<'s, B: SocketBufferT<'s>>(
+        &mut self,
+        timestamp: Instant,
+        sockets: &SocketSet<'s, B>,
+        handle: SocketHandle,
+    ) -> Option<Instant> {
+        self.inner.now = timestamp;
+        let inner = &mut self.inner;
+        let item = sockets.item_at(handle.index())?;
+        let socket_poll_at = item.socket.poll_at(inner);
+        match item
+            .meta
+            .poll_at(socket_poll_at, |ip_addr| inner.has_neighbor(&ip_addr))
+        {
+            PollAt::Ingress => None,
+            PollAt::Time(instant) => Some(instant),
+            PollAt::Now => Some(Instant::from_millis(0)),
+        }
     }
 
     /// Return an _advisory wait time_ for calling [poll] the next time.
@@ -691,13 +764,6 @@ impl Interface {
         device: &mut (impl Device + ?Sized),
         sockets: &mut SocketSet<'s, B>,
     ) -> PollResult {
-        let _caps = device.capabilities();
-
-        enum EgressError {
-            Exhausted,
-            Dispatch,
-        }
-
         let mut result = PollResult::None;
 
         let socket_count = sockets.storage_len();
@@ -712,110 +778,126 @@ impl Interface {
 
         for offset in 0..socket_count {
             let index = (start + offset) % socket_count;
-            let Some(item) = sockets.item_mut_at(index) else {
-                continue;
-            };
-
-            if !item
-                .meta
-                .egress_permitted(self.inner.now, |ip_addr| self.inner.has_neighbor(&ip_addr))
-            {
-                continue;
+            match self.socket_egress_index(device, sockets, index) {
+                SocketEgressOutcome::Changed => result = PollResult::SocketStateChanged,
+                SocketEgressOutcome::Exhausted => break,
+                SocketEgressOutcome::None => {}
             }
+        }
+        result
+    }
 
-            let mut neighbor_addr = None;
-            let mut respond = |inner: &mut InterfaceInner, meta: PacketMeta, response: Packet| {
-                neighbor_addr = Some(response.ip_repr().dst_addr());
-                let t = device.transmit(inner.now).ok_or_else(|| {
-                    net_debug!("failed to transmit IP: device exhausted");
-                    EgressError::Exhausted
-                })?;
+    fn socket_egress_index<'s, B: SocketBufferT<'s>>(
+        &mut self,
+        device: &mut (impl Device + ?Sized),
+        sockets: &mut SocketSet<'s, B>,
+        index: usize,
+    ) -> SocketEgressOutcome {
+        enum EgressError {
+            Exhausted,
+            Dispatch,
+        }
 
-                inner
-                    .dispatch_ip(t, meta, response, &mut self.fragmenter)
-                    .map_err(|_| EgressError::Dispatch)?;
+        let Some(item) = sockets.item_mut_at(index) else {
+            return SocketEgressOutcome::None;
+        };
 
-                result = PollResult::SocketStateChanged;
+        if !item
+            .meta
+            .egress_permitted(self.inner.now, |ip_addr| self.inner.has_neighbor(&ip_addr))
+        {
+            return SocketEgressOutcome::None;
+        }
 
-                Ok(())
-            };
+        let mut result = SocketEgressOutcome::None;
+        let mut neighbor_addr = None;
+        let mut respond = |inner: &mut InterfaceInner, meta: PacketMeta, response: Packet| {
+            neighbor_addr = Some(response.ip_repr().dst_addr());
+            let t = device.transmit(inner.now).ok_or_else(|| {
+                net_debug!("failed to transmit IP: device exhausted");
+                EgressError::Exhausted
+            })?;
 
-            let result = match &mut item.socket {
-                #[cfg(feature = "socket-raw")]
-                Socket::Raw(socket) => socket.dispatch(&mut self.inner, |inner, (ip, raw)| {
-                    respond(
+            inner
+                .dispatch_ip(t, meta, response, &mut self.fragmenter)
+                .map_err(|_| EgressError::Dispatch)?;
+
+            result = SocketEgressOutcome::Changed;
+
+            Ok(())
+        };
+
+        let dispatch_result = match &mut item.socket {
+            #[cfg(feature = "socket-raw")]
+            Socket::Raw(socket) => socket.dispatch(&mut self.inner, |inner, (ip, raw)| {
+                respond(
+                    inner,
+                    PacketMeta::default(),
+                    Packet::new(ip, IpPayload::Raw(raw)),
+                )
+            }),
+            #[cfg(feature = "socket-icmp")]
+            Socket::Icmp(socket) => {
+                socket.dispatch(&mut self.inner, |inner, response| match response {
+                    #[cfg(feature = "proto-ipv4")]
+                    (IpRepr::Ipv4(ipv4_repr), IcmpRepr::Ipv4(icmpv4_repr)) => respond(
                         inner,
                         PacketMeta::default(),
-                        Packet::new(ip, IpPayload::Raw(raw)),
-                    )
-                }),
-                #[cfg(feature = "socket-icmp")]
-                Socket::Icmp(socket) => {
-                    socket.dispatch(&mut self.inner, |inner, response| match response {
-                        #[cfg(feature = "proto-ipv4")]
-                        (IpRepr::Ipv4(ipv4_repr), IcmpRepr::Ipv4(icmpv4_repr)) => respond(
-                            inner,
-                            PacketMeta::default(),
-                            Packet::new_ipv4(ipv4_repr, IpPayload::Icmpv4(icmpv4_repr)),
-                        ),
-                        #[cfg(feature = "proto-ipv6")]
-                        (IpRepr::Ipv6(ipv6_repr), IcmpRepr::Ipv6(icmpv6_repr)) => respond(
-                            inner,
-                            PacketMeta::default(),
-                            Packet::new_ipv6(ipv6_repr, IpPayload::Icmpv6(icmpv6_repr)),
-                        ),
-                        #[allow(unreachable_patterns)]
-                        _ => unreachable!(),
-                    })
-                }
-                #[cfg(feature = "socket-udp")]
-                Socket::Udp(socket) => {
-                    socket.dispatch(&mut self.inner, |inner, meta, (ip, udp, payload)| {
-                        respond(inner, meta, Packet::new(ip, IpPayload::Udp(udp, payload)))
-                    })
-                }
-                #[cfg(feature = "socket-tcp")]
-                Socket::Tcp(socket) => socket.dispatch(&mut self.inner, |inner, (ip, tcp)| {
-                    respond(
+                        Packet::new_ipv4(ipv4_repr, IpPayload::Icmpv4(icmpv4_repr)),
+                    ),
+                    #[cfg(feature = "proto-ipv6")]
+                    (IpRepr::Ipv6(ipv6_repr), IcmpRepr::Ipv6(icmpv6_repr)) => respond(
                         inner,
                         PacketMeta::default(),
-                        Packet::new(ip, IpPayload::Tcp(tcp)),
-                    )
-                }),
-                #[cfg(feature = "socket-dhcpv4")]
-                Socket::Dhcpv4(socket) => {
-                    socket.dispatch(&mut self.inner, |inner, (ip, udp, dhcp)| {
-                        respond(
-                            inner,
-                            PacketMeta::default(),
-                            Packet::new_ipv4(ip, IpPayload::Dhcpv4(udp, dhcp)),
-                        )
-                    })
-                }
-                #[cfg(feature = "socket-dns")]
-                Socket::Dns(socket) => socket.dispatch(&mut self.inner, |inner, (ip, udp, dns)| {
-                    respond(
-                        inner,
-                        PacketMeta::default(),
-                        Packet::new(ip, IpPayload::Udp(udp, dns)),
-                    )
-                }),
-            };
-
-            match result {
-                Err(EgressError::Exhausted) => break, // Device buffer full.
-                Err(EgressError::Dispatch) => {
-                    // `NeighborCache` already takes care of rate limiting the neighbor discovery
-                    // requests from the socket. However, without an additional rate limiting
-                    // mechanism, we would spin on every socket that has yet to discover its
-                    // neighbor.
-                    item.meta.neighbor_missing(
-                        self.inner.now,
-                        neighbor_addr.expect("non-IP response packet"),
-                    );
-                }
-                Ok(()) => {}
+                        Packet::new_ipv6(ipv6_repr, IpPayload::Icmpv6(icmpv6_repr)),
+                    ),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!(),
+                })
             }
+            #[cfg(feature = "socket-udp")]
+            Socket::Udp(socket) => {
+                socket.dispatch(&mut self.inner, |inner, meta, (ip, udp, payload)| {
+                    respond(inner, meta, Packet::new(ip, IpPayload::Udp(udp, payload)))
+                })
+            }
+            #[cfg(feature = "socket-tcp")]
+            Socket::Tcp(socket) => socket.dispatch(&mut self.inner, |inner, (ip, tcp)| {
+                respond(
+                    inner,
+                    PacketMeta::default(),
+                    Packet::new(ip, IpPayload::Tcp(tcp)),
+                )
+            }),
+            #[cfg(feature = "socket-dhcpv4")]
+            Socket::Dhcpv4(socket) => {
+                socket.dispatch(&mut self.inner, |inner, (ip, udp, dhcp)| {
+                    respond(
+                        inner,
+                        PacketMeta::default(),
+                        Packet::new_ipv4(ip, IpPayload::Dhcpv4(udp, dhcp)),
+                    )
+                })
+            }
+            #[cfg(feature = "socket-dns")]
+            Socket::Dns(socket) => socket.dispatch(&mut self.inner, |inner, (ip, udp, dns)| {
+                respond(
+                    inner,
+                    PacketMeta::default(),
+                    Packet::new(ip, IpPayload::Udp(udp, dns)),
+                )
+            }),
+        };
+
+        match dispatch_result {
+            Err(EgressError::Exhausted) => return SocketEgressOutcome::Exhausted,
+            Err(EgressError::Dispatch) => {
+                item.meta.neighbor_missing(
+                    self.inner.now,
+                    neighbor_addr.expect("non-IP response packet"),
+                );
+            }
+            Ok(()) => {}
         }
         result
     }

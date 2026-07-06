@@ -46,7 +46,7 @@ impl fmt::Display for SocketHandle {
 }
 
 impl SocketHandle {
-    pub(crate) fn index(self) -> usize {
+    pub fn index(self) -> usize {
         self.0
     }
 }
@@ -178,5 +178,12 @@ impl<'a, B: SocketBufferT<'a>> SocketSet<'a, B> {
         self.sockets
             .get_mut(index)
             .and_then(|slot| slot.inner.as_mut())
+    }
+
+    /// Get a socket item by backing storage slot.
+    pub(crate) fn item_at(&self, index: usize) -> Option<&Item<'a, B>> {
+        self.sockets
+            .get(index)
+            .and_then(|slot| slot.inner.as_ref())
     }
 }
