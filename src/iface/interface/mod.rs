@@ -174,6 +174,20 @@ pub struct InterfaceInner {
     egress_start_index: usize,
     #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
     tcp_flow_cache: BTreeMap<TcpFlowKey, super::socket_set::SocketHandle>,
+    #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+    tcp_probe_cache_hits: usize,
+    #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+    tcp_probe_cache_misses: usize,
+    #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+    tcp_probe_linear_scanned: usize,
+}
+
+#[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TcpProbeStats {
+    pub cache_hits: usize,
+    pub cache_misses: usize,
+    pub linear_scanned: usize,
 }
 
 #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
@@ -316,6 +330,12 @@ impl Interface {
                 egress_start_index: 0,
                 #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
                 tcp_flow_cache: BTreeMap::new(),
+                #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+                tcp_probe_cache_hits: 0,
+                #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+                tcp_probe_cache_misses: 0,
+                #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+                tcp_probe_linear_scanned: 0,
             },
         }
     }
@@ -325,6 +345,11 @@ impl Interface {
     /// The context is needed for some socket methods.
     pub fn context(&mut self) -> &mut InterfaceInner {
         &mut self.inner
+    }
+
+    #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+    pub fn take_tcp_probe_stats(&mut self) -> TcpProbeStats {
+        self.inner.take_tcp_probe_stats()
     }
 
     /// Get the HardwareAddress address of the interface.
@@ -932,6 +957,34 @@ impl Interface {
 }
 
 impl InterfaceInner {
+    #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+    pub(crate) fn record_tcp_probe_cache_hit(&mut self) {
+        self.tcp_probe_cache_hits = self.tcp_probe_cache_hits.saturating_add(1);
+    }
+
+    #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+    pub(crate) fn record_tcp_probe_cache_miss(&mut self) {
+        self.tcp_probe_cache_misses = self.tcp_probe_cache_misses.saturating_add(1);
+    }
+
+    #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+    pub(crate) fn record_tcp_probe_linear_scan(&mut self) {
+        self.tcp_probe_linear_scanned = self.tcp_probe_linear_scanned.saturating_add(1);
+    }
+
+    #[cfg(all(feature = "latency-probe", feature = "alloc", feature = "socket-tcp"))]
+    pub(crate) fn take_tcp_probe_stats(&mut self) -> TcpProbeStats {
+        let stats = TcpProbeStats {
+            cache_hits: self.tcp_probe_cache_hits,
+            cache_misses: self.tcp_probe_cache_misses,
+            linear_scanned: self.tcp_probe_linear_scanned,
+        };
+        self.tcp_probe_cache_hits = 0;
+        self.tcp_probe_cache_misses = 0;
+        self.tcp_probe_linear_scanned = 0;
+        stats
+    }
+
     #[allow(unused)] // unused depending on which sockets are enabled
     pub(crate) fn now(&self) -> Instant {
         self.now
