@@ -1409,6 +1409,14 @@ impl<'a, B: SocketBufferT<'a>> Socket<'a, B> {
         self.rx_buffer.len()
     }
 
+    /// Return the next TCP sequence number expected from the remote peer.
+    ///
+    /// This is the ACK number that would cover all bytes already assembled into
+    /// the receive buffer, including bytes not yet read by userspace.
+    pub fn recv_next_seq(&self) -> u32 {
+        (self.remote_seq_no + self.rx_buffer.len()).0 as u32
+    }
+
     fn set_state(&mut self, state: State) {
         if self.state != state {
             tcp_trace!("state={}=>{}", self.state, state);
