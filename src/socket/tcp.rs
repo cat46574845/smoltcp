@@ -105,6 +105,40 @@ impl Display for RecvError {
 #[cfg(feature = "std")]
 impl std::error::Error for RecvError {}
 
+/// Error returned by [`Socket::commit_lossy_tail`].
+///
+/// The lossy-tail receive path is only valid after the TCP sequence spaces have
+/// been synchronized. The caller is expected to keep using the regular TCP path
+/// until the socket reaches one of the synchronized states.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum LossyTailCommitError {
+    InvalidState,
+}
+
+impl Display for LossyTailCommitError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            LossyTailCommitError::InvalidState => write!(f, "TCP sequence space is not synchronized"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for LossyTailCommitError {}
+
+/// State applied by [`Socket::commit_lossy_tail`].
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct LossyTailCommit {
+    /// The cumulative acknowledgement number that will be advertised.
+    pub receive_seq: TcpSeqNumber,
+    /// Bytes removed from the transmit buffer by the peer acknowledgement.
+    pub acknowledged: usize,
+    /// Whether the selected tail packet closed the socket.
+    pub closed: bool,
+}
+
 /// A TCP socket buffer.
 /// 
 /// This is the default buffer type for backwards compatibility.
@@ -1581,6 +1615,213 @@ impl<'a, B: SocketBufferT<'a>> Socket<'a, B> {
         }
     }
 
+    /// Commit only the selected tail segment to the live TCP state.
+    ///
+    /// This deliberately implements a lossy receive mode for latency-sensitive
+    /// feeds. It does not validate continuity against the current receive
+    /// sequence, does not reassemble skipped segments, and does not copy the
+    /// selected payload into the receive buffer. Any buffered receive data and
+    /// out-of-order ranges are discarded, and the cumulative receive sequence
+    /// is forced to the end of `repr`.
+    ///
+    /// Peer acknowledgement, window, timestamp and control information are
+    /// applied to this socket's existing sender/control state. This keeps the
+    /// socket as the single owner of retransmit and transmit-buffer state while
+    /// allowing the payload to be consumed by a separate raw-tail path.
+    pub fn commit_lossy_tail(
+        &mut self,
+        timestamp: Instant,
+        repr: &TcpRepr<'_>,
+    ) -> Result<LossyTailCommit, LossyTailCommitError> {
+        match self.state {
+            State::SynReceived
+            | State::Established
+            | State::FinWait1
+            | State::FinWait2
+            | State::CloseWait
+            | State::Closing
+            | State::LastAck
+            | State::TimeWait => {}
+            State::Closed | State::Listen | State::SynSent => {
+                return Err(LossyTailCommitError::InvalidState)
+            }
+        }
+
+        let sent_fin = matches!(self.state, State::FinWait1 | State::LastAck | State::Closing);
+        let tx_buffer_start_seq = self.local_seq_no;
+        let peer_ack = repr
+            .ack_number
+            .filter(|ack_number| *ack_number >= tx_buffer_start_seq);
+        let mut acknowledged = peer_ack
+            .map(|ack_number| ack_number - tx_buffer_start_seq)
+            .unwrap_or(0)
+            .min(self.tx_buffer.len());
+        let ack_of_fin = peer_ack
+            .map(|ack_number| {
+                sent_fin && ack_number - tx_buffer_start_seq > self.tx_buffer.len()
+            })
+            .unwrap_or(false);
+        if ack_of_fin {
+            acknowledged = self.tx_buffer.len();
+        }
+        let ack_all = peer_ack
+            .map(|ack_number| self.remote_last_seq <= ack_number)
+            .unwrap_or(false);
+
+        self.rx_buffer.clear();
+        self.assembler.clear();
+        self.remote_seq_no = repr.seq_number + repr.segment_len();
+        self.local_rx_last_seq = Some(repr.seq_number);
+        if repr.control == TcpControl::Fin {
+            self.rx_fin_received = true;
+        }
+
+        if let Some(ack_number) = peer_ack {
+            self.rtte.on_ack(timestamp, ack_number);
+            self.congestion_controller
+                .inner_mut()
+                .on_ack(timestamp, acknowledged, &self.rtte);
+        }
+
+        self.apply_lossy_tail_control(timestamp, repr.control, ack_of_fin);
+        self.apply_peer_sender_state(timestamp, repr, peer_ack, acknowledged, ack_all);
+
+        if self.tuple.is_some() {
+            // The selected tail must be acknowledged on the next dispatch; do
+            // not inherit the normal delayed-ACK policy.
+            self.ack_delay_timer = AckDelayTimer::Immediate;
+        }
+
+        Ok(LossyTailCommit {
+            receive_seq: self.remote_seq_no,
+            acknowledged,
+            closed: self.tuple.is_none(),
+        })
+    }
+
+    fn apply_lossy_tail_control(
+        &mut self,
+        timestamp: Instant,
+        control: TcpControl,
+        ack_of_fin: bool,
+    ) {
+        match (self.state, control.quash_psh(), ack_of_fin) {
+            (_, TcpControl::Rst, _) => {
+                self.set_state(State::Closed);
+                self.tuple = None;
+            }
+            (State::SynReceived | State::Established, TcpControl::Fin, _) => {
+                self.set_state(State::CloseWait);
+            }
+            (State::FinWait1, TcpControl::Fin, true) => {
+                self.set_state(State::TimeWait);
+                self.timer.set_for_close(timestamp);
+            }
+            (State::FinWait1, TcpControl::Fin, false) => self.set_state(State::Closing),
+            (State::FinWait2, TcpControl::Fin, _) => {
+                self.set_state(State::TimeWait);
+                self.timer.set_for_close(timestamp);
+            }
+            (State::FinWait1, _, true) => self.set_state(State::FinWait2),
+            (State::Closing, _, true) => {
+                self.set_state(State::TimeWait);
+                self.timer.set_for_close(timestamp);
+            }
+            (State::LastAck, _, true) => {
+                self.set_state(State::Closed);
+                self.tuple = None;
+            }
+            (State::TimeWait, TcpControl::Fin, _) => self.timer.set_for_close(timestamp),
+            _ => {}
+        }
+    }
+
+    fn apply_peer_sender_state(
+        &mut self,
+        timestamp: Instant,
+        repr: &TcpRepr<'_>,
+        peer_ack: Option<TcpSeqNumber>,
+        ack_len: usize,
+        ack_all: bool,
+    ) {
+        self.remote_last_ts = Some(timestamp);
+
+        let scale = match repr.control {
+            TcpControl::Syn => 0,
+            _ => self.remote_win_scale.unwrap_or(0),
+        };
+        let new_remote_win_len = (repr.window_len as usize) << (scale as usize);
+        let is_window_update = new_remote_win_len != self.remote_win_len;
+        self.remote_win_len = new_remote_win_len;
+        self.congestion_controller
+            .inner_mut()
+            .set_remote_window(new_remote_win_len);
+
+        if ack_len > 0 {
+            debug_assert!(self.tx_buffer.len() >= ack_len);
+            self.tx_buffer.dequeue_allocated(ack_len);
+
+            #[cfg(feature = "async")]
+            self.tx_waker.wake();
+        }
+
+        if let Some(ack_number) = peer_ack {
+            match self.local_rx_last_ack {
+                Some(last_rx_ack)
+                    if repr.payload.is_empty()
+                        && last_rx_ack == ack_number
+                        && ack_number < self.remote_last_seq
+                        && !is_window_update =>
+                {
+                    self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
+                    self.congestion_controller
+                        .inner_mut()
+                        .on_duplicate_ack(timestamp);
+                    if self.local_rx_dup_acks == 3 {
+                        self.timer.set_for_fast_retransmit();
+                    }
+                }
+                _ => {
+                    self.local_rx_dup_acks = 0;
+                    self.local_rx_last_ack = Some(ack_number);
+                }
+            }
+
+            self.local_seq_no = ack_number;
+            if self.remote_last_seq < self.local_seq_no {
+                self.remote_last_seq = self.local_seq_no;
+            }
+        }
+
+        if let Some(tcp_timestamp) = repr.timestamp {
+            self.last_remote_tsval = tcp_timestamp.tsval;
+        }
+
+        match self.timer {
+            Timer::Retransmit { .. } | Timer::FastRetransmit => {
+                if ack_all {
+                    self.timer.set_for_idle(timestamp, self.keep_alive);
+                } else if ack_len > 0 {
+                    let rto = self.rtte.retransmission_timeout();
+                    self.timer.set_for_retransmit(timestamp, rto);
+                }
+            }
+            Timer::Idle { .. } => self.timer.set_for_idle(timestamp, self.keep_alive),
+            _ => {}
+        }
+
+        if self.remote_win_len == 0
+            && !self.tx_buffer.is_empty()
+            && (self.timer.is_idle() || ack_len > 0)
+        {
+            let delay = self.rtte.retransmission_timeout();
+            self.timer.set_for_zero_window_probe(timestamp, delay);
+        }
+        if self.remote_win_len != 0 && self.timer.is_zero_window_probe() {
+            self.timer.set_for_idle(timestamp, self.keep_alive);
+        }
+    }
+
     pub(crate) fn process(
         &mut self,
         cx: &mut Context,
@@ -2019,139 +2260,7 @@ impl<'a, B: SocketBufferT<'a>> Socket<'a, B> {
             }
         }
 
-        // Update remote state.
-        self.remote_last_ts = Some(cx.now());
-
-        // RFC 1323: The window field (SEG.WND) in the header of every incoming segment, with the
-        // exception of SYN segments, is left-shifted by Snd.Wind.Scale bits before updating SND.WND.
-        let scale = match repr.control {
-            TcpControl::Syn => 0,
-            _ => self.remote_win_scale.unwrap_or(0),
-        };
-        let new_remote_win_len = (repr.window_len as usize) << (scale as usize);
-        let is_window_update = new_remote_win_len != self.remote_win_len;
-        self.remote_win_len = new_remote_win_len;
-
-        self.congestion_controller
-            .inner_mut()
-            .set_remote_window(new_remote_win_len);
-
-        if ack_len > 0 {
-            // Dequeue acknowledged octets.
-            debug_assert!(self.tx_buffer.len() >= ack_len);
-            tcp_trace!(
-                "tx buffer: dequeueing {} octets (now {})",
-                ack_len,
-                self.tx_buffer.len() - ack_len
-            );
-            self.tx_buffer.dequeue_allocated(ack_len);
-
-            // There's new room available in tx_buffer, wake the waiting task if any.
-            #[cfg(feature = "async")]
-            self.tx_waker.wake();
-        }
-
-        if let Some(ack_number) = repr.ack_number {
-            // TODO: When flow control is implemented,
-            // refractor the following block within that implementation
-
-            // Detect and react to duplicate ACKs by:
-            // 1. Check if duplicate ACK and change self.local_rx_dup_acks accordingly
-            // 2. If exactly 3 duplicate ACKs received, set for fast retransmit
-            // 3. Update the last received ACK (self.local_rx_last_ack)
-            match self.local_rx_last_ack {
-                // Duplicate ACK if payload empty and ACK doesn't move send window ->
-                // Increment duplicate ACK count and set for retransmit if we just received
-                // the third duplicate ACK
-                Some(last_rx_ack)
-                    if repr.payload.is_empty()
-                        && last_rx_ack == ack_number
-                        && ack_number < self.remote_last_seq
-                        && !is_window_update =>
-                {
-                    // Increment duplicate ACK count
-                    self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
-
-                    // Inform congestion controller of duplicate ACK
-                    self.congestion_controller
-                        .inner_mut()
-                        .on_duplicate_ack(cx.now());
-
-                    net_debug!(
-                        "received duplicate ACK for seq {} (duplicate nr {}{})",
-                        ack_number,
-                        self.local_rx_dup_acks,
-                        if self.local_rx_dup_acks == u8::MAX {
-                            "+"
-                        } else {
-                            ""
-                        }
-                    );
-
-                    if self.local_rx_dup_acks == 3 {
-                        self.timer.set_for_fast_retransmit();
-                        net_debug!("started fast retransmit");
-                    }
-                }
-                // No duplicate ACK -> Reset state and update last received ACK
-                _ => {
-                    if self.local_rx_dup_acks > 0 {
-                        self.local_rx_dup_acks = 0;
-                        net_debug!("reset duplicate ACK count");
-                    }
-                    self.local_rx_last_ack = Some(ack_number);
-                }
-            };
-            // We've processed everything in the incoming segment, so advance the local
-            // sequence number past it.
-            self.local_seq_no = ack_number;
-            // During retransmission, if an earlier segment got lost but later was
-            // successfully received, self.local_seq_no can move past self.remote_last_seq.
-            // Do not attempt to retransmit the latter segments; not only this is pointless
-            // in theory but also impossible in practice, since they have been already
-            // deallocated from the buffer.
-            if self.remote_last_seq < self.local_seq_no {
-                self.remote_last_seq = self.local_seq_no
-            }
-        }
-
-        // update last remote tsval
-        if let Some(timestamp) = repr.timestamp {
-            self.last_remote_tsval = timestamp.tsval;
-        }
-
-        // update timers.
-        match self.timer {
-            Timer::Retransmit { .. } | Timer::FastRetransmit => {
-                if ack_all {
-                    // RFC 6298: (5.2) ACK of all outstanding data turn off the retransmit timer.
-                    self.timer.set_for_idle(cx.now(), self.keep_alive);
-                } else if ack_len > 0 {
-                    // (5.3) ACK of new data in ESTABLISHED state restart the retransmit timer.
-                    let rto = self.rtte.retransmission_timeout();
-                    self.timer.set_for_retransmit(cx.now(), rto);
-                }
-            }
-            Timer::Idle { .. } => {
-                // any packet on idle refresh the keepalive timer.
-                self.timer.set_for_idle(cx.now(), self.keep_alive);
-            }
-            _ => {}
-        }
-
-        // start/stop the Zero Window Probe timer.
-        if self.remote_win_len == 0
-            && !self.tx_buffer.is_empty()
-            && (self.timer.is_idle() || ack_len > 0)
-        {
-            let delay = self.rtte.retransmission_timeout();
-            tcp_trace!("starting zero-window-probe timer for t+{}", delay);
-            self.timer.set_for_zero_window_probe(cx.now(), delay);
-        }
-        if self.remote_win_len != 0 && self.timer.is_zero_window_probe() {
-            tcp_trace!("stopping zero-window-probe timer");
-            self.timer.set_for_idle(cx.now(), self.keep_alive);
-        }
+        self.apply_peer_sender_state(cx.now(), repr, repr.ack_number, ack_len, ack_all);
 
         let payload_len = payload.len();
         if payload_len == 0 {
@@ -8936,6 +9045,102 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
+    }
+
+    #[test]
+    fn lossy_tail_forces_receive_end_and_immediate_ack() {
+        let mut s = socket_established();
+        assert_eq!(s.rx_buffer.enqueue_slice(b"obsolete"), 8);
+        s.assembler.add(16, 4).unwrap();
+        assert_eq!(s.send_slice(b"ping"), Ok(4));
+
+        let tail = TcpRepr {
+            control: TcpControl::Psh,
+            seq_number: REMOTE_SEQ + 500,
+            ack_number: Some(LOCAL_SEQ + 5),
+            window_len: 511,
+            payload: b"latest",
+            ..SEND_TEMPL
+        };
+        let committed = s
+            .commit_lossy_tail(Instant::from_millis(7), &tail)
+            .unwrap();
+
+        assert_eq!(committed.receive_seq, REMOTE_SEQ + 506);
+        assert_eq!(committed.acknowledged, 4);
+        assert!(!committed.closed);
+        assert!(s.rx_buffer.is_empty());
+        assert!(s.assembler.is_empty());
+        assert!(s.tx_buffer.is_empty());
+        assert_eq!(s.local_seq_no, LOCAL_SEQ + 5);
+        assert_eq!(s.remote_seq_no, REMOTE_SEQ + 506);
+        assert_eq!(s.remote_win_len, 511);
+        assert_eq!(s.ack_delay_timer, AckDelayTimer::Immediate);
+        assert!(s.ack_to_transmit());
+
+        s.cx.set_now(Instant::from_millis(7));
+        let mut emitted = None;
+        let result: Result<(), ()> = s.socket.dispatch(&mut s.cx, |_, (_, tcp)| {
+            emitted = Some((
+                tcp.seq_number,
+                tcp.ack_number,
+                tcp.window_len,
+                tcp.payload.len(),
+            ));
+            Ok(())
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            emitted,
+            Some((
+                LOCAL_SEQ + 5,
+                Some(REMOTE_SEQ + 506),
+                s.scaled_window(),
+                0,
+            ))
+        );
+    }
+
+    #[test]
+    fn lossy_tail_does_not_regress_sender_on_stale_peer_ack() {
+        let mut s = socket_established();
+        s.local_seq_no = LOCAL_SEQ + 20;
+        s.remote_last_seq = LOCAL_SEQ + 20;
+        assert_eq!(s.send_slice(b"pending"), Ok(7));
+
+        let committed = s
+            .commit_lossy_tail(
+                Instant::from_millis(9),
+                &TcpRepr {
+                    seq_number: REMOTE_SEQ + 1_000,
+                    ack_number: Some(LOCAL_SEQ + 10),
+                    payload: b"tail",
+                    ..SEND_TEMPL
+                },
+            )
+            .unwrap();
+
+        assert_eq!(committed.acknowledged, 0);
+        assert_eq!(s.local_seq_no, LOCAL_SEQ + 20);
+        assert_eq!(s.tx_buffer.len(), 7);
+        assert_eq!(s.remote_seq_no, REMOTE_SEQ + 1_004);
+    }
+
+    #[test]
+    fn lossy_tail_rejects_unsynchronized_socket_without_mutation() {
+        let mut s = socket();
+        let result = s.commit_lossy_tail(
+            Instant::from_millis(1),
+            &TcpRepr {
+                seq_number: REMOTE_SEQ,
+                payload: b"tail",
+                ..SEND_TEMPL
+            },
+        );
+
+        assert_eq!(result, Err(LossyTailCommitError::InvalidState));
+        assert_eq!(s.state(), State::Closed);
+        assert_eq!(s.remote_seq_no, TcpSeqNumber::default());
     }
 
     // =========================================================================================//
