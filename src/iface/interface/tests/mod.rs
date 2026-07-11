@@ -245,3 +245,68 @@ pub fn tcp_not_accepted() {
         None,
     );
 }
+
+#[test]
+#[cfg(all(
+    feature = "medium-ip",
+    feature = "proto-ipv4",
+    feature = "socket-tcp",
+    feature = "alloc",
+    feature = "market-trace"
+))]
+fn pre_registered_tcp_flow_avoids_first_packet_linear_scan() {
+    use crate::socket::tcp;
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; 64]),
+        tcp::SocketBuffer::new(vec![0; 64]),
+    );
+    let handle = sockets.add(socket);
+    let local = IpEndpoint::new(Ipv4Address::new(192, 168, 1, 1).into(), 30_000);
+    let remote = IpEndpoint::new(Ipv4Address::new(192, 168, 1, 2).into(), 443);
+    sockets
+        .get_mut::<tcp::Socket>(handle)
+        .connect(iface.context(), remote, local)
+        .unwrap();
+    iface.register_tcp_flow(handle, local, remote).unwrap();
+
+    let syn_ack = TcpRepr {
+        src_port: remote.port,
+        dst_port: local.port,
+        control: TcpControl::Syn,
+        seq_number: TcpSeqNumber(20_000),
+        ack_number: Some(TcpSeqNumber(10_001)),
+        window_len: 256,
+        window_scale: None,
+        max_seg_size: Some(1_460),
+        sack_permitted: false,
+        sack_ranges: [None, None, None],
+        timestamp: None,
+        payload: &[],
+    };
+    let ip_repr = IpRepr::Ipv4(Ipv4Repr {
+        src_addr: Ipv4Address::new(192, 168, 1, 2),
+        dst_addr: Ipv4Address::new(192, 168, 1, 1),
+        next_header: IpProtocol::Tcp,
+        payload_len: syn_ack.buffer_len(),
+        hop_limit: 64,
+    });
+    let mut bytes = vec![0; syn_ack.buffer_len()];
+    syn_ack.emit(
+        &mut TcpPacket::new_unchecked(&mut bytes),
+        &ip_repr.src_addr(),
+        &ip_repr.dst_addr(),
+        &ChecksumCapabilities::default(),
+    );
+
+    iface.inner.process_tcp(&mut sockets, false, ip_repr, &bytes);
+    let stats = iface.take_tcp_probe_stats();
+    assert_eq!(stats.cache_hits, 1);
+    assert_eq!(stats.cache_misses, 0);
+    assert_eq!(stats.linear_scanned, 0);
+    assert_eq!(sockets.get::<tcp::Socket>(handle).state(), tcp::State::Established);
+
+    assert!(iface.unregister_tcp_flow(handle));
+    assert!(!iface.unregister_tcp_flow(handle));
+}

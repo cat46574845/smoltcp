@@ -38,7 +38,7 @@ impl InterfaceInner {
         #[cfg(feature = "alloc")]
         {
             let key = TcpFlowKey::from_incoming(&ip_repr, &tcp_repr);
-            if let Some(handle) = self.tcp_flow_cache.get(&key).copied() {
+            if let Some(handle) = self.tcp_flow_cache.get(&key) {
                 let cached = sockets.item_mut_at(handle.index()).and_then(|item| {
                     if let crate::socket::Socket::Tcp(ref mut tcp_socket) = item.socket {
                         if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
@@ -49,7 +49,7 @@ impl InterfaceInner {
                                 .process(self, &ip_repr, &tcp_repr)
                                 .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
                             if !tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
-                                self.tcp_flow_cache.remove(&key);
+                                self.tcp_flow_cache.remove_key(&key);
                             }
                             Some(packet)
                         } else {
@@ -66,7 +66,7 @@ impl InterfaceInner {
 
                 #[cfg(any(feature = "latency-probe", feature = "market-trace"))]
                 self.record_tcp_probe_cache_miss();
-                self.tcp_flow_cache.remove(&key);
+                self.tcp_flow_cache.remove_key(&key);
             } else {
                 #[cfg(any(feature = "latency-probe", feature = "market-trace"))]
                 self.record_tcp_probe_cache_miss();
@@ -86,9 +86,11 @@ impl InterfaceInner {
                     {
                         let key = TcpFlowKey::from_incoming(&ip_repr, &tcp_repr);
                         if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
-                            self.tcp_flow_cache.insert(key, item.meta.handle);
+                            if let Err(error) = self.tcp_flow_cache.insert(key, item.meta.handle) {
+                                net_debug!("TCP flow cache registration failed: {:?}", error);
+                            }
                         } else {
-                            self.tcp_flow_cache.remove(&key);
+                            self.tcp_flow_cache.remove_key(&key);
                         }
                     }
                     return packet;

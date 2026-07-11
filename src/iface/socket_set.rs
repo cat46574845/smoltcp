@@ -49,6 +49,11 @@ impl SocketHandle {
     pub fn index(self) -> usize {
         self.0
     }
+
+    #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+    pub(crate) fn from_index(index: usize) -> Self {
+        Self(index)
+    }
 }
 
 /// An extensible set of sockets.
