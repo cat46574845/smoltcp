@@ -26,6 +26,8 @@ mod udp;
 
 use super::packet::*;
 
+#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+use core::fmt;
 use core::result::Result;
 use heapless::Vec;
 
@@ -122,6 +124,58 @@ pub enum PollEgressHandleResult {
     /// The device transmit path had no token available.
     DeviceExhausted,
 }
+
+/// Result of polling the configured gateway's active neighbor probe.
+#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum GatewayNeighborProbeResult {
+    /// No gateway probe is currently due.
+    NotDue,
+    /// An ARP request was dispatched and the probe timestamp was recorded.
+    Sent,
+    /// The device had no transmit token; the probe remains due for an immediate retry.
+    DeviceExhausted,
+}
+
+/// Error returned while dispatching the configured gateway's active neighbor probe.
+#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum GatewayNeighborProbeError {
+    /// Active gateway probing is only available on an Ethernet interface and device.
+    NonEthernetMedium,
+    /// The configured gateway is not IPv4 and therefore cannot be resolved with ARP.
+    NonIpv4Gateway,
+    /// The interface has no IPv4 address usable as the ARP sender protocol address.
+    NoSourceAddress,
+    /// The ARP request could not be dispatched through the transmit token.
+    DispatchFailed,
+    /// The configured gateway changed before the successful probe could be recorded.
+    GatewayChanged,
+}
+
+#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+impl fmt::Display for GatewayNeighborProbeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonEthernetMedium => write!(f, "gateway neighbor probe requires Ethernet"),
+            Self::NonIpv4Gateway => write!(f, "gateway neighbor probe requires an IPv4 gateway"),
+            Self::NoSourceAddress => {
+                write!(f, "gateway neighbor probe has no IPv4 source address")
+            }
+            Self::DispatchFailed => write!(f, "gateway neighbor ARP request dispatch failed"),
+            Self::GatewayChanged => write!(f, "configured gateway changed during probe dispatch"),
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "medium-ethernet",
+    feature = "proto-ipv4",
+    feature = "std"
+))]
+impl std::error::Error for GatewayNeighborProbeError {}
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum SocketEgressOutcome {
@@ -393,6 +447,71 @@ impl Interface {
     ) -> bool {
         self.inner
             .mark_gateway_neighbor_probe_sent(timestamp, gateway)
+    }
+
+    /// Dispatch an active ARP probe when the configured gateway is due.
+    ///
+    /// This path deliberately bypasses normal neighbor lookup so a retained
+    /// last-known-good gateway mapping cannot suppress a background refresh.
+    /// The probe timestamp is recorded only after the ARP request is dispatched.
+    #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+    pub fn poll_gateway_neighbor_probe(
+        &mut self,
+        timestamp: Instant,
+        device: &mut (impl Device + ?Sized),
+    ) -> Result<GatewayNeighborProbeResult, GatewayNeighborProbeError> {
+        self.inner.now = timestamp;
+
+        let Some(gateway) = self.inner.gateway_neighbor_probe_due(timestamp) else {
+            return Ok(GatewayNeighborProbeResult::NotDue);
+        };
+
+        if self.inner.caps.medium != Medium::Ethernet
+            || device.capabilities().medium != Medium::Ethernet
+        {
+            return Err(GatewayNeighborProbeError::NonEthernetMedium);
+        }
+
+        #[allow(unreachable_patterns)]
+        let gateway_v4 = match gateway {
+            IpAddress::Ipv4(gateway) => gateway,
+            _ => return Err(GatewayNeighborProbeError::NonIpv4Gateway),
+        };
+        #[allow(unreachable_patterns)]
+        let source_hardware_addr = match self.inner.hardware_addr {
+            HardwareAddress::Ethernet(address) => address,
+            _ => return Err(GatewayNeighborProbeError::NonEthernetMedium),
+        };
+        let source_protocol_addr = self
+            .inner
+            .get_source_address_ipv4(&gateway_v4)
+            .ok_or(GatewayNeighborProbeError::NoSourceAddress)?;
+        let Some(tx_token) = device.transmit(timestamp) else {
+            return Ok(GatewayNeighborProbeResult::DeviceExhausted);
+        };
+        let arp_repr = ArpRepr::EthernetIpv4 {
+            operation: ArpOperation::Request,
+            source_hardware_addr,
+            source_protocol_addr,
+            target_hardware_addr: EthernetAddress::BROADCAST,
+            target_protocol_addr: gateway_v4,
+        };
+
+        self.inner
+            .dispatch_ethernet(tx_token, arp_repr.buffer_len(), |mut frame| {
+                frame.set_dst_addr(EthernetAddress::BROADCAST);
+                frame.set_ethertype(EthernetProtocol::Arp);
+                arp_repr.emit(&mut ArpPacket::new_unchecked(frame.payload_mut()));
+            })
+            .map_err(|_| GatewayNeighborProbeError::DispatchFailed)?;
+
+        if !self
+            .inner
+            .mark_gateway_neighbor_probe_sent(timestamp, gateway)
+        {
+            return Err(GatewayNeighborProbeError::GatewayChanged);
+        }
+        Ok(GatewayNeighborProbeResult::Sent)
     }
 
     #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]

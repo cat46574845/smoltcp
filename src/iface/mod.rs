@@ -26,6 +26,8 @@ pub use self::interface::{
     Config, Interface, InterfaceInner as Context, PollEgressHandleResult,
     PollIngressSingleResult, PollResult,
 };
+#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+pub use self::interface::{GatewayNeighborProbeError, GatewayNeighborProbeResult};
 
 pub use self::route::{Route, RouteTableFull, Routes};
 pub use self::socket_set::{SocketHandle, SocketSet, SocketStorage};

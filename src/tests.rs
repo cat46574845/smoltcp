@@ -60,6 +60,7 @@ pub struct TestingDevice {
     pub(crate) rx_queue: VecDeque<Vec<u8>>,
     max_transmission_unit: usize,
     medium: Medium,
+    tx_available: bool,
 }
 
 #[allow(clippy::new_without_default)]
@@ -81,7 +82,12 @@ impl TestingDevice {
                 Medium::Ieee802154 => 1500,
             },
             medium,
+            tx_available: true,
         }
+    }
+
+    pub(crate) fn set_tx_available(&mut self, available: bool) {
+        self.tx_available = available;
     }
 }
 
@@ -108,9 +114,13 @@ impl Device for TestingDevice {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(TxToken {
-            queue: &mut self.tx_queue,
-        })
+        if self.tx_available {
+            Some(TxToken {
+                queue: &mut self.tx_queue,
+            })
+        } else {
+            None
+        }
     }
 }
 
