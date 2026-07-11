@@ -15,6 +15,8 @@ use crate::latency_probe;
 use crate::socket::WakerRegistration;
 use crate::socket::{Context, PollAt};
 use crate::storage::{Assembler, RingBuffer, SocketBufferT};
+#[cfg(feature = "alloc")]
+use crate::storage::LinearBuffer;
 use crate::time::{Duration, Instant};
 use crate::wire::{
     IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, TCP_HEADER_LEN, TcpControl,
@@ -2866,6 +2868,38 @@ impl<'a, B: SocketBufferT<'a>> Socket<'a, B> {
                 .min()
                 .unwrap_or(&PollAt::Ingress)
         }
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<'a> Socket<'a, LinearBuffer<'a>> {
+    /// Consume a socket and recover its owned RX and TX backing allocations.
+    ///
+    /// This operation does not allocate, copy or clear either buffer. It is
+    /// intended for socket pools that remove a socket before recycling both
+    /// allocations. If either buffer is borrowed, the original socket is
+    /// returned unchanged.
+    pub fn into_owned_buffers(
+        self,
+    ) -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), Self> {
+        if !self.rx_buffer.has_owned_storage() || !self.tx_buffer.has_owned_storage() {
+            return Err(self);
+        }
+
+        let Socket {
+            rx_buffer,
+            tx_buffer,
+            ..
+        } = self;
+        let rx_storage = match rx_buffer.into_owned_storage() {
+            Ok(storage) => storage,
+            Err(_) => unreachable!("owned RX storage was checked before consuming the socket"),
+        };
+        let tx_storage = match tx_buffer.into_owned_storage() {
+            Ok(storage) => storage,
+            Err(_) => unreachable!("owned TX storage was checked before consuming the socket"),
+        };
+        Ok((rx_storage, tx_storage))
     }
 }
 
@@ -9141,6 +9175,37 @@ mod test {
         assert_eq!(result, Err(LossyTailCommitError::InvalidState));
         assert_eq!(s.state(), State::Closed);
         assert_eq!(s.remote_seq_no, TcpSeqNumber::default());
+    }
+
+    #[test]
+    fn into_owned_buffers_recovers_linear_socket_allocations() {
+        let mut s = socket_established_generic::<crate::storage::LinearBuffer<'static>>(17, 31);
+        let rx_ptr = s.rx_buffer.get_allocated(0, 0).as_ptr();
+        assert_eq!(s.send_slice(b"pending"), Ok(7));
+
+        let (rx_storage, tx_storage) = s.socket.into_owned_buffers().unwrap();
+        assert_eq!(rx_storage.len(), 31);
+        assert_eq!(tx_storage.len(), 17);
+        assert_eq!(rx_storage.as_ptr(), rx_ptr);
+        assert_eq!(&tx_storage[..7], b"pending");
+    }
+
+    #[test]
+    fn into_owned_buffers_preserves_socket_with_borrowed_storage() {
+        let mut rx_storage = [0u8; 31];
+        let mut tx_storage = [0u8; 17];
+        let socket = Socket::new(
+            crate::storage::LinearBuffer::new(&mut rx_storage[..]),
+            crate::storage::LinearBuffer::new(&mut tx_storage[..]),
+        );
+
+        let socket = match socket.into_owned_buffers() {
+            Ok(_) => panic!("borrowed socket must not yield owned buffers"),
+            Err(socket) => socket,
+        };
+        assert_eq!(socket.recv_capacity(), 31);
+        assert_eq!(socket.send_capacity(), 17);
+        assert_eq!(socket.state(), State::Closed);
     }
 
     // =========================================================================================//

@@ -98,6 +98,26 @@ impl<'a> LinearBuffer<'a> {
         self.window_reserve = reserve;
     }
 
+    /// Return whether this buffer owns its backing allocation.
+    #[inline]
+    #[cfg(feature = "alloc")]
+    pub fn has_owned_storage(&self) -> bool {
+        matches!(self.storage, ManagedSlice::Owned(_))
+    }
+
+    /// Consume this buffer and return its owned backing allocation.
+    ///
+    /// The returned vector keeps the original length and allocation. Buffer
+    /// cursors and occupied data are intentionally discarded so the allocation
+    /// can be recycled without copying or clearing it.
+    #[cfg(feature = "alloc")]
+    pub fn into_owned_storage(self) -> Result<alloc::vec::Vec<u8>, &'a mut [u8]> {
+        match self.storage {
+            ManagedSlice::Owned(storage) => Ok(storage),
+            ManagedSlice::Borrowed(storage) => Err(storage),
+        }
+    }
+
 }
 
 impl<'a> SocketBufferT<'a> for LinearBuffer<'a> {
@@ -353,6 +373,30 @@ mod tests {
         // After dequeue, buffer is empty, read_at is reset to 0
         assert_eq!(buf.read_at, 0);
         assert_eq!(buf.window(), 64);
+    }
+
+    #[test]
+    fn into_owned_storage_reuses_original_allocation() {
+        let storage = vec![0u8; 64];
+        let original_ptr = storage.as_ptr();
+        let mut buf = LinearBuffer::new(storage);
+        assert_eq!(buf.enqueue_slice(b"recycle"), 7);
+
+        let storage = buf.into_owned_storage().unwrap();
+        assert_eq!(storage.len(), 64);
+        assert_eq!(storage.as_ptr(), original_ptr);
+        assert_eq!(&storage[..7], b"recycle");
+    }
+
+    #[test]
+    fn into_owned_storage_returns_borrowed_slice() {
+        let mut storage = [0u8; 16];
+        let original_ptr = storage.as_ptr();
+        let buf = LinearBuffer::new(&mut storage[..]);
+
+        let borrowed = buf.into_owned_storage().unwrap_err();
+        assert_eq!(borrowed.len(), 16);
+        assert_eq!(borrowed.as_ptr(), original_ptr);
     }
 
     #[test]
