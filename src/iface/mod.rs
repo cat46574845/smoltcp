@@ -20,6 +20,8 @@ mod packet;
 
 #[cfg(feature = "multicast")]
 pub use self::interface::multicast::MulticastError;
+#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+pub use self::neighbor::{GatewayNeighborConfigError, GatewayNeighborUpdate};
 pub use self::interface::{
     Config, Interface, InterfaceInner as Context, PollEgressHandleResult,
     PollIngressSingleResult, PollResult,

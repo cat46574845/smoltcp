@@ -62,6 +62,70 @@ fn test_any_ip_accept_arp(#[case] medium: Medium) {
     );
 }
 
+#[test]
+#[cfg(all(feature = "medium-ethernet", feature = "socket-tcp", feature = "alloc"))]
+fn arp_reply_immediately_reports_gateway_waiters() {
+    use crate::socket::tcp;
+
+    let (mut iface, mut sockets, _) = setup(Medium::Ethernet);
+    let gateway = IpAddress::Ipv4(Ipv4Address::new(192, 168, 1, 2));
+    iface
+        .configure_gateway_neighbor(Instant::ZERO, gateway, Duration::from_secs(300))
+        .unwrap();
+
+    let socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; 16]),
+        tcp::SocketBuffer::new(vec![0; 16]),
+    );
+    let handle = sockets.add(socket);
+    sockets
+        .item_mut_at(handle.index())
+        .unwrap()
+        .meta
+        .neighbor_missing(Instant::ZERO, gateway);
+
+    let remote_hardware = EthernetAddress::from_bytes(&[0x02, 0x02, 0x02, 0x02, 0x02, 0x03]);
+    let local_hardware = EthernetAddress::from_bytes(&[0x02, 0x02, 0x02, 0x02, 0x02, 0x02]);
+    let ethernet_repr = EthernetRepr {
+        src_addr: remote_hardware,
+        dst_addr: local_hardware,
+        ethertype: EthernetProtocol::Arp,
+    };
+    let arp_repr = ArpRepr::EthernetIpv4 {
+        operation: ArpOperation::Reply,
+        source_hardware_addr: remote_hardware,
+        source_protocol_addr: Ipv4Address::new(192, 168, 1, 2),
+        target_hardware_addr: local_hardware,
+        target_protocol_addr: Ipv4Address::new(192, 168, 1, 1),
+    };
+    let mut bytes = vec![0; ethernet_repr.buffer_len() + arp_repr.buffer_len()];
+    let mut frame = EthernetFrame::new_unchecked(&mut bytes);
+    ethernet_repr.emit(&mut frame);
+    arp_repr.emit(&mut ArpPacket::new_unchecked(frame.payload_mut()));
+
+    let mut touched = vec![];
+    assert!(
+        iface
+            .inner
+            .process_ethernet_touched(
+                &mut sockets,
+                PacketMeta::default(),
+                &bytes,
+                &mut iface.fragments,
+                &mut |socket| touched.push(socket),
+            )
+            .is_none()
+    );
+    assert_eq!(touched, vec![handle]);
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&gateway, Instant::from_secs(3_600)),
+        NeighborAnswer::Found(remote_hardware.into())
+    );
+}
+
 #[rstest]
 #[case(Medium::Ip)]
 #[cfg(feature = "medium-ip")]

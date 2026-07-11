@@ -4,6 +4,7 @@ use managed::ManagedSlice;
 use super::socket_meta::Meta;
 use crate::socket::{AnySocket, Socket};
 use crate::storage::{SocketBufferT, RingBuffer};
+use crate::wire::IpAddress;
 
 /// Opaque struct with space for storing one socket.
 ///
@@ -190,5 +191,57 @@ impl<'a, B: SocketBufferT<'a>> SocketSet<'a, B> {
         self.sockets
             .get(index)
             .and_then(|slot| slot.inner.as_ref())
+    }
+
+    /// Activate sockets waiting for `neighbor` and report their handles.
+    ///
+    /// The callback lets an external per-socket scheduler immediately replace
+    /// a previous discovery deadline after an ARP/ND resolution completes.
+    pub fn activate_neighbor_waiters(
+        &mut self,
+        neighbor: IpAddress,
+        mut on_activated: impl FnMut(SocketHandle),
+    ) -> usize {
+        let mut activated = 0;
+        for item in self.items_mut() {
+            if item.meta.activate_if_waiting_for(neighbor) {
+                activated += 1;
+                on_activated(item.meta.handle);
+            }
+        }
+        activated
+    }
+}
+
+#[cfg(all(test, feature = "socket-tcp", feature = "alloc"))]
+mod tests {
+    use super::*;
+    use crate::socket::tcp;
+    use crate::time::Instant;
+    use crate::wire::Ipv4Address;
+
+    #[test]
+    #[cfg(feature = "proto-ipv4")]
+    fn activate_neighbor_waiters_reports_each_socket_once() {
+        let mut sockets: SocketSet<'static> = SocketSet::new(alloc::vec![]);
+        let socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(alloc::vec![0; 16]),
+            tcp::SocketBuffer::new(alloc::vec![0; 16]),
+        );
+        let handle = sockets.add(socket);
+        let gateway = Ipv4Address::new(10, 0, 0, 1).into();
+        sockets
+            .item_mut_at(handle.index())
+            .unwrap()
+            .meta
+            .neighbor_missing(Instant::from_millis(0), gateway);
+
+        let mut activated = alloc::vec::Vec::new();
+        assert_eq!(
+            sockets.activate_neighbor_waiters(gateway, |handle| activated.push(handle)),
+            1
+        );
+        assert_eq!(activated, alloc::vec![handle]);
+        assert_eq!(sockets.activate_neighbor_waiters(gateway, |_| {}), 0);
     }
 }

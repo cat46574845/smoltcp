@@ -36,7 +36,10 @@ use super::fragmentation::PacketAssemblerSet;
 use super::fragmentation::{Fragmenter, FragmentsBuffer};
 
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-use super::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache};
+use super::neighbor::{
+    Answer as NeighborAnswer, Cache as NeighborCache, GatewayNeighborConfigError,
+    GatewayNeighborUpdate,
+};
 use super::socket_set::{SocketHandle, SocketSet};
 #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
 use super::tcp_flow_cache::{TcpFlowCache, TcpFlowCacheError, TcpFlowKey};
@@ -349,6 +352,47 @@ impl Interface {
     #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
     pub fn unregister_tcp_flow(&mut self, handle: SocketHandle) -> bool {
         self.inner.unregister_tcp_flow(handle)
+    }
+
+    /// Configure the single gateway whose last-known-good link address may be
+    /// used after normal neighbor-cache expiry.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    pub fn configure_gateway_neighbor(
+        &mut self,
+        timestamp: Instant,
+        gateway: IpAddress,
+        soft_stale_after: Duration,
+    ) -> Result<(), GatewayNeighborConfigError> {
+        self.inner
+            .configure_gateway_neighbor(timestamp, gateway, soft_stale_after)
+    }
+
+    /// Observe a trusted ingress link address for the configured gateway.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    pub fn observe_gateway_hardware_addr(
+        &mut self,
+        timestamp: Instant,
+        hardware_addr: HardwareAddress,
+    ) -> GatewayNeighborUpdate {
+        self.inner
+            .observe_gateway_hardware_addr(timestamp, hardware_addr)
+    }
+
+    /// Return the configured gateway when startup/background resolution is due.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    pub fn gateway_neighbor_probe_due(&self, timestamp: Instant) -> Option<IpAddress> {
+        self.inner.gateway_neighbor_probe_due(timestamp)
+    }
+
+    /// Record a successfully queued gateway neighbor probe.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    pub fn mark_gateway_neighbor_probe_sent(
+        &mut self,
+        timestamp: Instant,
+        gateway: IpAddress,
+    ) -> bool {
+        self.inner
+            .mark_gateway_neighbor_probe_sent(timestamp, gateway)
     }
 
     #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
@@ -977,6 +1021,47 @@ impl InterfaceInner {
     #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
     pub fn unregister_tcp_flow(&mut self, handle: SocketHandle) -> bool {
         self.tcp_flow_cache.remove_handle(handle)
+    }
+
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    pub fn configure_gateway_neighbor(
+        &mut self,
+        timestamp: Instant,
+        gateway: IpAddress,
+        soft_stale_after: Duration,
+    ) -> Result<(), GatewayNeighborConfigError> {
+        self.neighbor_cache
+            .configure_gateway(gateway, timestamp, soft_stale_after)
+    }
+
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    pub fn observe_gateway_hardware_addr(
+        &mut self,
+        timestamp: Instant,
+        hardware_addr: HardwareAddress,
+    ) -> GatewayNeighborUpdate {
+        self.neighbor_cache
+            .observe_gateway_hardware_addr(hardware_addr, timestamp)
+    }
+
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    pub fn configured_gateway_neighbor(&self) -> Option<IpAddress> {
+        self.neighbor_cache.configured_gateway()
+    }
+
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    pub fn gateway_neighbor_probe_due(&self, timestamp: Instant) -> Option<IpAddress> {
+        self.neighbor_cache.gateway_probe_due(timestamp)
+    }
+
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    pub fn mark_gateway_neighbor_probe_sent(
+        &mut self,
+        timestamp: Instant,
+        gateway: IpAddress,
+    ) -> bool {
+        self.neighbor_cache
+            .mark_gateway_probe_sent(gateway, timestamp)
     }
 
     #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]

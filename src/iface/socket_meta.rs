@@ -100,4 +100,17 @@ impl Meta {
             silent_until: timestamp + Self::DISCOVERY_SILENT_TIME,
         };
     }
+
+    pub(crate) fn activate_if_waiting_for(&mut self, neighbor: IpAddress) -> bool {
+        match self.neighbor_state {
+            NeighborState::Waiting {
+                neighbor: waiting_for,
+                ..
+            } if waiting_for == neighbor => {
+                self.neighbor_state = NeighborState::Active;
+                true
+            }
+            _ => false,
+        }
+    }
 }
