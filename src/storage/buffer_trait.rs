@@ -14,8 +14,9 @@ use managed::ManagedSlice;
 ///
 /// - `RingBuffer`: Uses wrap-around semantics. `window()` returns total available space
 ///   which may be non-contiguous.
-/// - `LinearBuffer`: Never wraps. `window()` returns contiguous tail space.
-///   Compacts data when tail space is exhausted and data is below threshold.
+/// - `LinearBuffer`: Never wraps. `window()` returns its virtual advertised space:
+///   physical tail space plus reclaimable head space beyond its configured reserve.
+///   A subsequent write compacts on demand when it needs that head space.
 pub trait SocketBufferT<'a>: Sized + core::fmt::Debug {
     // === Construction and Basic Operations ===
 
@@ -37,12 +38,14 @@ pub trait SocketBufferT<'a>: Sized + core::fmt::Debug {
     ///
     /// # Semantics
     /// - `RingBuffer`: `capacity - len` (total available, may be non-contiguous)
-    /// - `LinearBuffer`: Contiguous tail space (always equals `contiguous_window`)
+    /// - `LinearBuffer`: Virtual advertised space, which may include reclaimable head
+    ///   space and therefore may be larger than `contiguous_window()`.
     fn window(&self) -> usize;
 
     /// Return the largest contiguous available space.
     ///
-    /// For `LinearBuffer`, this equals `window()`.
+    /// For `LinearBuffer`, this is the physical tail space available before compaction
+    /// and may be smaller than `window()`.
     fn contiguous_window(&self) -> usize;
 
     /// Query whether the buffer is empty.

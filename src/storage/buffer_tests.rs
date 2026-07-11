@@ -207,6 +207,11 @@ fn test_full_buffer<'a, B: TestBuffer<'a>>() {
 
     // Dequeue some
     buf.dequeue_allocated(4);
+    assert_eq!(buf.len(), 4);
+
+    // LinearBuffer reclaims consumed head space on the next write instead of
+    // moving the remaining data during dequeue.
+    assert_eq!(buf.enqueue_slice(b"x"), 1);
     assert!(!buf.is_full());
     assert!(buf.window() > 0);
 }
