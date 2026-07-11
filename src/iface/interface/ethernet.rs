@@ -12,12 +12,39 @@ impl InterfaceInner {
         self.process_ethernet_touched(sockets, meta, frame, fragments, &mut |_| {})
     }
 
+    #[inline(always)]
     pub(super) fn process_ethernet_touched<'frame, 's, B: SocketBufferT<'s>>(
         &mut self,
         sockets: &mut SocketSet<'s, B>,
         meta: crate::phy::PacketMeta,
         frame: &'frame [u8],
         fragments: &'frame mut FragmentsBuffer,
+        on_touched: &mut impl FnMut(SocketHandle),
+    ) -> Option<EthernetPacket<'frame>> {
+        self.process_ethernet_touched_with_gateway_observer(
+            sockets,
+            meta,
+            frame,
+            fragments,
+            &mut IgnoreGatewayIngress,
+            on_touched,
+        )
+    }
+
+    pub(super) fn process_ethernet_touched_with_gateway_observer<
+        'frame,
+        's,
+        B: SocketBufferT<'s>,
+        O: GatewayIngressObserver,
+    >(
+        &mut self,
+        sockets: &mut SocketSet<'s, B>,
+        meta: crate::phy::PacketMeta,
+        frame: &'frame [u8],
+        #[allow(unused_variables)]
+        fragments: &'frame mut FragmentsBuffer,
+        #[allow(unused_variables)]
+        gateway_observer: &mut O,
         on_touched: &mut impl FnMut(SocketHandle),
     ) -> Option<EthernetPacket<'frame>> {
         let eth_frame = check!(EthernetFrame::new_checked(frame));
@@ -43,12 +70,13 @@ impl InterfaceInner {
             EthernetProtocol::Ipv4 => {
                 let ipv4_packet = check!(Ipv4Packet::new_checked(eth_frame.payload()));
 
-                self.process_ipv4_touched(
+                self.process_ipv4_touched_with_gateway_observer(
                     sockets,
                     meta,
                     eth_frame.src_addr().into(),
                     &ipv4_packet,
                     fragments,
+                    gateway_observer,
                     on_touched,
                 )
                 .map(EthernetPacket::Ip)
