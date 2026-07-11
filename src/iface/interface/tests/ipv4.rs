@@ -1,5 +1,175 @@
 use super::*;
 
+#[cfg(feature = "medium-ethernet")]
+fn assert_gateway_arp_request(
+    bytes: &[u8],
+    source_hardware_addr: EthernetAddress,
+    source_protocol_addr: Ipv4Address,
+    target_protocol_addr: Ipv4Address,
+) {
+    let frame = EthernetFrame::new_checked(bytes).unwrap();
+    assert_eq!(frame.src_addr(), source_hardware_addr);
+    assert_eq!(frame.dst_addr(), EthernetAddress::BROADCAST);
+    assert_eq!(frame.ethertype(), EthernetProtocol::Arp);
+    let packet = ArpPacket::new_checked(frame.payload()).unwrap();
+    assert_eq!(
+        ArpRepr::parse(&packet).unwrap(),
+        ArpRepr::EthernetIpv4 {
+            operation: ArpOperation::Request,
+            source_hardware_addr,
+            source_protocol_addr,
+            target_hardware_addr: EthernetAddress::BROADCAST,
+            target_protocol_addr,
+        }
+    );
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn gateway_neighbor_probe_sends_startup_arp_request() {
+    let (mut iface, _sockets, mut device) = setup(Medium::Ethernet);
+    let gateway_v4 = Ipv4Address::new(192, 168, 1, 2);
+    let gateway = IpAddress::Ipv4(gateway_v4);
+    iface
+        .configure_gateway_neighbor(Instant::ZERO, gateway, Duration::from_secs(300))
+        .unwrap();
+
+    assert_eq!(
+        iface.poll_gateway_neighbor_probe(Instant::ZERO, &mut device),
+        Ok(GatewayNeighborProbeResult::Sent)
+    );
+    assert_eq!(iface.gateway_neighbor_probe_due(Instant::ZERO), None);
+    assert_gateway_arp_request(
+        &device.tx_queue.pop_front().unwrap(),
+        EthernetAddress::from_bytes(&[0x02, 0x02, 0x02, 0x02, 0x02, 0x02]),
+        Ipv4Address::new(192, 168, 1, 1),
+        gateway_v4,
+    );
+    assert!(device.tx_queue.is_empty());
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn gateway_neighbor_probe_bypasses_last_known_good_lookup_when_soft_stale() {
+    let (mut iface, _sockets, mut device) = setup(Medium::Ethernet);
+    let gateway_v4 = Ipv4Address::new(192, 168, 1, 2);
+    let gateway = IpAddress::Ipv4(gateway_v4);
+    let gateway_hardware_addr =
+        HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]));
+    iface
+        .configure_gateway_neighbor(Instant::ZERO, gateway, Duration::from_secs(300))
+        .unwrap();
+    assert_eq!(
+        iface.observe_gateway_hardware_addr(Instant::ZERO, gateway_hardware_addr),
+        GatewayNeighborUpdate::Resolved
+    );
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&gateway, Instant::from_secs(300)),
+        NeighborAnswer::Found(gateway_hardware_addr)
+    );
+
+    assert_eq!(
+        iface.poll_gateway_neighbor_probe(Instant::from_secs(299), &mut device),
+        Ok(GatewayNeighborProbeResult::NotDue)
+    );
+    assert_eq!(
+        iface.poll_gateway_neighbor_probe(Instant::from_secs(300), &mut device),
+        Ok(GatewayNeighborProbeResult::Sent)
+    );
+    assert_gateway_arp_request(
+        &device.tx_queue.pop_front().unwrap(),
+        EthernetAddress::from_bytes(&[0x02, 0x02, 0x02, 0x02, 0x02, 0x02]),
+        Ipv4Address::new(192, 168, 1, 1),
+        gateway_v4,
+    );
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn gateway_neighbor_probe_device_exhaustion_does_not_mark_and_retries_immediately() {
+    let (mut iface, _sockets, mut device) = setup(Medium::Ethernet);
+    let gateway = IpAddress::Ipv4(Ipv4Address::new(192, 168, 1, 2));
+    iface
+        .configure_gateway_neighbor(Instant::ZERO, gateway, Duration::from_secs(300))
+        .unwrap();
+    device.set_tx_available(false);
+
+    assert_eq!(
+        iface.poll_gateway_neighbor_probe(Instant::ZERO, &mut device),
+        Ok(GatewayNeighborProbeResult::DeviceExhausted)
+    );
+    assert_eq!(
+        iface.gateway_neighbor_probe_due(Instant::ZERO),
+        Some(gateway)
+    );
+    assert!(device.tx_queue.is_empty());
+
+    device.set_tx_available(true);
+    assert_eq!(
+        iface.poll_gateway_neighbor_probe(Instant::ZERO, &mut device),
+        Ok(GatewayNeighborProbeResult::Sent)
+    );
+    assert_eq!(iface.gateway_neighbor_probe_due(Instant::ZERO), None);
+    assert_eq!(device.tx_queue.len(), 1);
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn gateway_neighbor_probe_without_configuration_is_not_due() {
+    let (mut iface, _sockets, mut device) = setup(Medium::Ethernet);
+    device.set_tx_available(false);
+
+    assert_eq!(
+        iface.poll_gateway_neighbor_probe(Instant::ZERO, &mut device),
+        Ok(GatewayNeighborProbeResult::NotDue)
+    );
+    assert!(device.tx_queue.is_empty());
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn gateway_neighbor_probe_without_ipv4_source_returns_typed_error() {
+    let mut device = crate::tests::TestingDevice::new(Medium::Ethernet);
+    let hardware_addr =
+        HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[0x02, 0x02, 0x02, 0x02, 0x02, 0x02]));
+    let mut iface = Interface::new(Config::new(hardware_addr), &mut device, Instant::ZERO);
+    iface
+        .configure_gateway_neighbor(
+            Instant::ZERO,
+            IpAddress::Ipv4(Ipv4Address::new(192, 168, 1, 2)),
+            Duration::from_secs(300),
+        )
+        .unwrap();
+
+    assert_eq!(
+        iface.poll_gateway_neighbor_probe(Instant::ZERO, &mut device),
+        Err(GatewayNeighborProbeError::NoSourceAddress)
+    );
+    assert!(device.tx_queue.is_empty());
+}
+
+#[test]
+#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv6"))]
+fn gateway_neighbor_probe_with_ipv6_gateway_returns_typed_error() {
+    let (mut iface, _sockets, mut device) = setup(Medium::Ethernet);
+    iface
+        .configure_gateway_neighbor(
+            Instant::ZERO,
+            IpAddress::Ipv6(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2)),
+            Duration::from_secs(300),
+        )
+        .unwrap();
+
+    assert_eq!(
+        iface.poll_gateway_neighbor_probe(Instant::ZERO, &mut device),
+        Err(GatewayNeighborProbeError::NonIpv4Gateway)
+    );
+    assert!(device.tx_queue.is_empty());
+}
+
 #[rstest]
 #[case(Medium::Ethernet)]
 #[cfg(feature = "medium-ethernet")]
