@@ -293,6 +293,16 @@ impl InterfaceInner {
         timestamp: Instant,
         eth_frame: &EthernetFrame<&'frame [u8]>,
     ) -> Option<EthernetPacket<'frame>> {
+        self.process_arp_touched(timestamp, eth_frame, &mut |_| {})
+    }
+
+    #[cfg(feature = "medium-ethernet")]
+    pub(super) fn process_arp_touched<'frame>(
+        &mut self,
+        timestamp: Instant,
+        eth_frame: &EthernetFrame<&'frame [u8]>,
+        on_neighbor_ready: &mut impl FnMut(IpAddress),
+    ) -> Option<EthernetPacket<'frame>> {
         let arp_packet = check!(ArpPacket::new_checked(eth_frame.payload()));
         let arp_repr = check!(ArpRepr::parse(&arp_packet));
 
@@ -335,6 +345,7 @@ impl InterfaceInner {
                     source_hardware_addr.into(),
                     timestamp,
                 );
+                on_neighbor_ready(source_protocol_addr.into());
 
                 if operation == ArpOperation::Request {
                     let src_hardware_addr = self.hardware_addr.ethernet_or_panic();
