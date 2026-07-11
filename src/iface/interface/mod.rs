@@ -113,6 +113,19 @@ pub enum PollIngressSingleResult {
     SocketStateChanged,
 }
 
+/// Result of processing one ingress packet with an optional, one-shot
+/// configured-gateway observation.
+#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct PollIngressSingleGatewayObservation {
+    /// The ordinary ingress result for the packet.
+    pub poll_result: PollIngressSingleResult,
+    /// The configured gateway update produced from this packet, if the
+    /// observation was requested and the IPv4 source routes through it.
+    pub gateway_update: Option<GatewayNeighborUpdate>,
+}
+
 /// Result returned by [`Interface::poll_egress_handle`].
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -182,6 +195,55 @@ enum SocketEgressOutcome {
     None,
     Changed,
     Exhausted,
+}
+
+trait GatewayIngressObserver {
+    const ENABLED: bool;
+
+    fn observe_routed_source(
+        &mut self,
+        _inner: &mut InterfaceInner,
+        _source_protocol_addr: IpAddress,
+        _source_hardware_addr: HardwareAddress,
+    ) {
+    }
+}
+
+struct IgnoreGatewayIngress;
+
+impl GatewayIngressObserver for IgnoreGatewayIngress {
+    const ENABLED: bool = false;
+}
+
+#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+struct CaptureGatewayIngress {
+    update: Option<GatewayNeighborUpdate>,
+}
+
+#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+impl GatewayIngressObserver for CaptureGatewayIngress {
+    const ENABLED: bool = true;
+
+    fn observe_routed_source(
+        &mut self,
+        inner: &mut InterfaceInner,
+        source_protocol_addr: IpAddress,
+        source_hardware_addr: HardwareAddress,
+    ) {
+        if !source_protocol_addr.is_unicast() {
+            return;
+        }
+        let Some(configured_gateway) = inner.configured_gateway_neighbor() else {
+            return;
+        };
+        if inner.route(&source_protocol_addr, inner.now) != Some(configured_gateway) {
+            return;
+        }
+
+        self.update = Some(
+            inner.observe_gateway_hardware_addr(inner.now, source_hardware_addr),
+        );
+    }
 }
 
 /// A  network interface.
@@ -818,6 +880,51 @@ impl Interface {
         self.socket_ingress_touched(device, sockets, on_touched)
     }
 
+    /// Process one incoming packet and optionally use this packet as the
+    /// configured gateway's single passive observation for an outer RX drain.
+    ///
+    /// Observation is attempted only after the existing Ethernet and IPv4
+    /// ingress validation has accepted the packet, and only when routing a
+    /// reply to its source selects the configured gateway. The already parsed
+    /// Ethernet source address is reused; the frame is not read a second time.
+    /// Callers should set `observe_gateway` for at most one packet per drain.
+    #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+    pub fn poll_ingress_single_touched_with_gateway_observation<
+        's,
+        B: SocketBufferT<'s>,
+    >(
+        &mut self,
+        timestamp: Instant,
+        device: &mut (impl Device + ?Sized),
+        sockets: &mut SocketSet<'s, B>,
+        observe_gateway: bool,
+        on_touched: impl FnMut(SocketHandle),
+    ) -> PollIngressSingleGatewayObservation {
+        self.inner.now = timestamp;
+
+        #[cfg(feature = "_proto-fragmentation")]
+        self.fragments.assembler.remove_expired(timestamp);
+
+        if !observe_gateway {
+            return PollIngressSingleGatewayObservation {
+                poll_result: self.socket_ingress_touched(device, sockets, on_touched),
+                gateway_update: None,
+            };
+        }
+
+        let mut observer = CaptureGatewayIngress { update: None };
+        let poll_result = self.socket_ingress_touched_with_gateway_observer(
+            device,
+            sockets,
+            &mut observer,
+            on_touched,
+        );
+        PollIngressSingleGatewayObservation {
+            poll_result,
+            gateway_update: observer.update,
+        }
+    }
+
     /// Return a _soft deadline_ for calling [poll] the next time.
     /// The [Instant] returned is the time at which you should call [poll] next.
     /// It is harmless (but wastes energy) to call it before the [Instant], and
@@ -897,10 +1004,31 @@ impl Interface {
         }
     }
 
+    #[inline(always)]
     fn socket_ingress_touched<'s, B: SocketBufferT<'s>>(
         &mut self,
         device: &mut (impl Device + ?Sized),
         sockets: &mut SocketSet<'s, B>,
+        on_touched: impl FnMut(SocketHandle),
+    ) -> PollIngressSingleResult {
+        self.socket_ingress_touched_with_gateway_observer(
+            device,
+            sockets,
+            &mut IgnoreGatewayIngress,
+            on_touched,
+        )
+    }
+
+    fn socket_ingress_touched_with_gateway_observer<
+        's,
+        B: SocketBufferT<'s>,
+        O: GatewayIngressObserver,
+    >(
+        &mut self,
+        device: &mut (impl Device + ?Sized),
+        sockets: &mut SocketSet<'s, B>,
+        #[allow(unused_variables)]
+        gateway_observer: &mut O,
         mut on_touched: impl FnMut(SocketHandle),
     ) -> PollIngressSingleResult {
         let Some((rx_token, tx_token)) = device.receive(self.inner.now) else {
@@ -916,11 +1044,14 @@ impl Interface {
             match self.inner.caps.medium {
                 #[cfg(feature = "medium-ethernet")]
                 Medium::Ethernet => {
-                    if let Some(packet) = self.inner.process_ethernet_touched(
+                    if let Some(packet) = self
+                        .inner
+                        .process_ethernet_touched_with_gateway_observer(
                         sockets,
                         rx_meta,
                         frame,
                         &mut self.fragments,
+                        gateway_observer,
                         &mut on_touched,
                     )
                     {

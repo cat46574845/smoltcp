@@ -24,6 +24,73 @@ fn assert_gateway_arp_request(
     );
 }
 
+#[cfg(feature = "medium-ethernet")]
+fn gateway_observation_ipv4_frame(
+    source_hardware_addr: EthernetAddress,
+    source_protocol_addr: Ipv4Address,
+) -> Vec<u8> {
+    let ethernet_repr = EthernetRepr {
+        src_addr: source_hardware_addr,
+        dst_addr: EthernetAddress::from_bytes(&[0x02, 0x02, 0x02, 0x02, 0x02, 0x02]),
+        ethertype: EthernetProtocol::Ipv4,
+    };
+    let ipv4_repr = Ipv4Repr {
+        src_addr: source_protocol_addr,
+        dst_addr: Ipv4Address::new(192, 168, 1, 1),
+        next_header: IpProtocol::Unknown(253),
+        payload_len: 0,
+        hop_limit: 64,
+    };
+    let mut bytes = vec![0; ethernet_repr.buffer_len() + ipv4_repr.buffer_len()];
+    let mut frame = EthernetFrame::new_unchecked(&mut bytes);
+    ethernet_repr.emit(&mut frame);
+    ipv4_repr.emit(
+        &mut Ipv4Packet::new_unchecked(frame.payload_mut()),
+        &ChecksumCapabilities::default(),
+    );
+    bytes
+}
+
+#[cfg(feature = "medium-ethernet")]
+fn gateway_observation_non_ipv4_frame(source_hardware_addr: EthernetAddress) -> Vec<u8> {
+    let ethernet_repr = EthernetRepr {
+        src_addr: source_hardware_addr,
+        dst_addr: EthernetAddress::from_bytes(&[0x02, 0x02, 0x02, 0x02, 0x02, 0x02]),
+        ethertype: EthernetProtocol::Unknown(0x88b5),
+    };
+    let mut bytes = vec![0; ethernet_repr.buffer_len()];
+    ethernet_repr.emit(&mut EthernetFrame::new_unchecked(&mut bytes));
+    bytes
+}
+
+#[cfg(feature = "medium-ethernet")]
+fn setup_gateway_observation(
+) -> (
+    Interface,
+    SocketSet<'static>,
+    crate::tests::TestingDevice,
+    IpAddress,
+    HardwareAddress,
+) {
+    let (mut iface, sockets, device) = setup(Medium::Ethernet);
+    let gateway_v4 = Ipv4Address::new(192, 168, 1, 2);
+    let gateway = IpAddress::Ipv4(gateway_v4);
+    let initial_hardware_addr =
+        HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01]));
+    iface
+        .routes_mut()
+        .add_default_ipv4_route(gateway_v4)
+        .unwrap();
+    iface
+        .configure_gateway_neighbor(Instant::ZERO, gateway, Duration::from_secs(30))
+        .unwrap();
+    assert_eq!(
+        iface.observe_gateway_hardware_addr(Instant::ZERO, initial_hardware_addr),
+        GatewayNeighborUpdate::Resolved
+    );
+    (iface, sockets, device, gateway, initial_hardware_addr)
+}
+
 #[test]
 #[cfg(feature = "medium-ethernet")]
 fn gateway_neighbor_probe_sends_startup_arp_request() {
@@ -127,6 +194,203 @@ fn gateway_neighbor_probe_without_configuration_is_not_due() {
         Ok(GatewayNeighborProbeResult::NotDue)
     );
     assert!(device.tx_queue.is_empty());
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn selected_routed_external_ipv4_updates_gateway_from_parsed_ethernet_source() {
+    let (mut iface, mut sockets, mut device, gateway, _) = setup_gateway_observation();
+    let changed_hardware_addr =
+        HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x02]));
+    device.rx_queue.push_back(gateway_observation_ipv4_frame(
+        changed_hardware_addr.ethernet_or_panic(),
+        Ipv4Address::new(203, 0, 113, 7),
+    ));
+
+    let result = iface.poll_ingress_single_touched_with_gateway_observation(
+        Instant::from_secs(10),
+        &mut device,
+        &mut sockets,
+        true,
+        |_| {},
+    );
+
+    assert_eq!(result.poll_result, PollIngressSingleResult::SocketStateChanged);
+    assert_eq!(result.gateway_update, Some(GatewayNeighborUpdate::Changed));
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&gateway, Instant::from_secs(3_600)),
+        NeighborAnswer::Found(changed_hardware_addr)
+    );
+    assert_eq!(iface.gateway_neighbor_probe_due(Instant::from_secs(39)), None);
+    assert_eq!(
+        iface.gateway_neighbor_probe_due(Instant::from_secs(40)),
+        Some(gateway)
+    );
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn selected_same_subnet_ipv4_does_not_pollute_gateway_observation() {
+    let (mut iface, mut sockets, mut device, gateway, initial_hardware_addr) =
+        setup_gateway_observation();
+    device.rx_queue.push_back(gateway_observation_ipv4_frame(
+        EthernetAddress::from_bytes(&[0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x03]),
+        Ipv4Address::new(192, 168, 1, 77),
+    ));
+
+    let result = iface.poll_ingress_single_touched_with_gateway_observation(
+        Instant::from_secs(10),
+        &mut device,
+        &mut sockets,
+        true,
+        |_| {},
+    );
+
+    assert_eq!(result.gateway_update, None);
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&gateway, Instant::from_secs(3_600)),
+        NeighborAnswer::Found(initial_hardware_addr)
+    );
+    assert_eq!(
+        iface.gateway_neighbor_probe_due(Instant::from_secs(30)),
+        Some(gateway)
+    );
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn selected_routed_ipv4_with_invalid_source_mac_is_ignored() {
+    let (mut iface, mut sockets, mut device, gateway, initial_hardware_addr) =
+        setup_gateway_observation();
+    device.rx_queue.push_back(gateway_observation_ipv4_frame(
+        EthernetAddress::from_bytes(&[0x01, 0xaa, 0xbb, 0xcc, 0xdd, 0x04]),
+        Ipv4Address::new(203, 0, 113, 8),
+    ));
+
+    let result = iface.poll_ingress_single_touched_with_gateway_observation(
+        Instant::from_secs(10),
+        &mut device,
+        &mut sockets,
+        true,
+        |_| {},
+    );
+
+    assert_eq!(result.gateway_update, Some(GatewayNeighborUpdate::Ignored));
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&gateway, Instant::from_secs(3_600)),
+        NeighborAnswer::Found(initial_hardware_addr)
+    );
+    assert_eq!(
+        iface.gateway_neighbor_probe_due(Instant::from_secs(30)),
+        Some(gateway)
+    );
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn selected_non_ipv4_frame_does_not_observe_gateway() {
+    let (mut iface, mut sockets, mut device, gateway, initial_hardware_addr) =
+        setup_gateway_observation();
+    device
+        .rx_queue
+        .push_back(gateway_observation_non_ipv4_frame(
+            EthernetAddress::from_bytes(&[0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x05]),
+        ));
+
+    let result = iface.poll_ingress_single_touched_with_gateway_observation(
+        Instant::from_secs(10),
+        &mut device,
+        &mut sockets,
+        true,
+        |_| {},
+    );
+
+    assert_eq!(result.gateway_update, None);
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&gateway, Instant::from_secs(3_600)),
+        NeighborAnswer::Found(initial_hardware_addr)
+    );
+    assert_eq!(
+        iface.gateway_neighbor_probe_due(Instant::from_secs(30)),
+        Some(gateway)
+    );
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn selected_invalid_ipv4_frame_does_not_observe_gateway() {
+    let (mut iface, mut sockets, mut device, gateway, initial_hardware_addr) =
+        setup_gateway_observation();
+    let mut frame = gateway_observation_non_ipv4_frame(
+        EthernetAddress::from_bytes(&[0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x06]),
+    );
+    EthernetFrame::new_unchecked(&mut frame).set_ethertype(EthernetProtocol::Ipv4);
+    device.rx_queue.push_back(frame);
+
+    let result = iface.poll_ingress_single_touched_with_gateway_observation(
+        Instant::from_secs(10),
+        &mut device,
+        &mut sockets,
+        true,
+        |_| {},
+    );
+
+    assert_eq!(result.gateway_update, None);
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&gateway, Instant::from_secs(3_600)),
+        NeighborAnswer::Found(initial_hardware_addr)
+    );
+    assert_eq!(
+        iface.gateway_neighbor_probe_due(Instant::from_secs(30)),
+        Some(gateway)
+    );
+}
+
+#[test]
+#[cfg(feature = "medium-ethernet")]
+fn disabled_selected_observation_uses_original_ingress_without_gateway_write() {
+    let (mut iface, mut sockets, mut device, gateway, initial_hardware_addr) =
+        setup_gateway_observation();
+    device.rx_queue.push_back(gateway_observation_ipv4_frame(
+        EthernetAddress::from_bytes(&[0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x07]),
+        Ipv4Address::new(203, 0, 113, 9),
+    ));
+
+    let result = iface.poll_ingress_single_touched_with_gateway_observation(
+        Instant::from_secs(10),
+        &mut device,
+        &mut sockets,
+        false,
+        |_| {},
+    );
+
+    assert_eq!(result.gateway_update, None);
+    assert_eq!(
+        iface
+            .inner
+            .neighbor_cache
+            .lookup(&gateway, Instant::from_secs(3_600)),
+        NeighborAnswer::Found(initial_hardware_addr)
+    );
+    assert_eq!(
+        iface.gateway_neighbor_probe_due(Instant::from_secs(30)),
+        Some(gateway)
+    );
 }
 
 #[test]
@@ -1011,7 +1275,7 @@ fn test_handle_igmp(#[case] medium: Medium) {
     // loopback have been processed, including responses to
     // GENERAL_QUERY_BYTES. Therefore `recv_all()` would return 0
     // pkts that could be checked.
-    iface.socket_ingress(&mut device, &mut sockets);
+    iface.socket_ingress_touched(&mut device, &mut sockets, |_| {});
 
     // Leave multicast groups
     let timestamp = Instant::ZERO;

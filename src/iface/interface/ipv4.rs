@@ -111,6 +111,7 @@ impl InterfaceInner {
         )
     }
 
+    #[inline(always)]
     pub(super) fn process_ipv4_touched<'a, 's, B: SocketBufferT<'s>>(
         &mut self,
         sockets: &mut SocketSet<'s, B>,
@@ -118,6 +119,32 @@ impl InterfaceInner {
         source_hardware_addr: HardwareAddress,
         ipv4_packet: &Ipv4Packet<&'a [u8]>,
         #[allow(unused_variables)] frag: &'a mut FragmentsBuffer,
+        on_touched: &mut impl FnMut(SocketHandle),
+    ) -> Option<Packet<'a>> {
+        self.process_ipv4_touched_with_gateway_observer(
+            sockets,
+            meta,
+            source_hardware_addr,
+            ipv4_packet,
+            frag,
+            &mut IgnoreGatewayIngress,
+            on_touched,
+        )
+    }
+
+    pub(super) fn process_ipv4_touched_with_gateway_observer<
+        'a,
+        's,
+        B: SocketBufferT<'s>,
+        O: GatewayIngressObserver,
+    >(
+        &mut self,
+        sockets: &mut SocketSet<'s, B>,
+        meta: PacketMeta,
+        source_hardware_addr: HardwareAddress,
+        ipv4_packet: &Ipv4Packet<&'a [u8]>,
+        #[allow(unused_variables)] frag: &'a mut FragmentsBuffer,
+        gateway_observer: &mut O,
         on_touched: &mut impl FnMut(SocketHandle),
     ) -> Option<Packet<'a>> {
         let ipv4_repr = check!(Ipv4Repr::parse(ipv4_packet, &self.caps.checksum));
@@ -231,6 +258,14 @@ impl InterfaceInner {
 
                 return None;
             }
+        }
+
+        if O::ENABLED {
+            gateway_observer.observe_routed_source(
+                self,
+                IpAddress::Ipv4(ipv4_repr.src_addr),
+                source_hardware_addr,
+            );
         }
 
         #[cfg(feature = "medium-ethernet")]
