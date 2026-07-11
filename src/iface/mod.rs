@@ -13,6 +13,8 @@ mod route;
 mod rpl;
 mod socket_meta;
 mod socket_set;
+#[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+mod tcp_flow_cache;
 
 mod packet;
 
@@ -25,3 +27,5 @@ pub use self::interface::{
 
 pub use self::route::{Route, RouteTableFull, Routes};
 pub use self::socket_set::{SocketHandle, SocketSet, SocketStorage};
+#[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+pub use self::tcp_flow_cache::TcpFlowCacheError;

@@ -38,6 +38,8 @@ use super::fragmentation::{Fragmenter, FragmentsBuffer};
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use super::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache};
 use super::socket_set::{SocketHandle, SocketSet};
+#[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+use super::tcp_flow_cache::{TcpFlowCache, TcpFlowCacheError, TcpFlowKey};
 #[cfg(feature = "proto-sixlowpan")]
 use crate::config::IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT;
 use crate::config::IFACE_MAX_ADDR_COUNT;
@@ -50,9 +52,6 @@ use crate::storage::SocketBufferT;
 use crate::time::{Duration, Instant};
 
 use crate::wire::*;
-
-#[cfg(all(feature = "alloc", feature = "socket-tcp"))]
-use alloc::collections::BTreeMap;
 
 macro_rules! check {
     ($e:expr) => {
@@ -173,7 +172,7 @@ pub struct InterfaceInner {
     /// Round-robin index for socket egress to ensure fair scheduling
     egress_start_index: usize,
     #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
-    tcp_flow_cache: BTreeMap<TcpFlowKey, super::socket_set::SocketHandle>,
+    tcp_flow_cache: TcpFlowCache,
     #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
     tcp_probe_cache_hits: usize,
     #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
@@ -188,27 +187,6 @@ pub struct TcpProbeStats {
     pub cache_hits: usize,
     pub cache_misses: usize,
     pub linear_scanned: usize,
-}
-
-#[cfg(all(feature = "alloc", feature = "socket-tcp"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct TcpFlowKey {
-    local_addr: IpAddress,
-    local_port: u16,
-    remote_addr: IpAddress,
-    remote_port: u16,
-}
-
-#[cfg(all(feature = "alloc", feature = "socket-tcp"))]
-impl TcpFlowKey {
-    pub(crate) fn from_incoming(ip_repr: &IpRepr, tcp_repr: &TcpRepr<'_>) -> Self {
-        Self {
-            local_addr: ip_repr.dst_addr(),
-            local_port: tcp_repr.dst_port,
-            remote_addr: ip_repr.src_addr(),
-            remote_port: tcp_repr.src_port,
-        }
-    }
 }
 
 /// Configuration structure used for creating a network interface.
@@ -228,6 +206,13 @@ pub struct Config {
     /// Creating the interface panics if the address is not unicast.
     pub hardware_addr: HardwareAddress,
 
+    /// Maximum number of active TCP 4-tuples kept in the fixed flow cache.
+    ///
+    /// Storage is allocated once by [`Interface::new`]. The cache does not
+    /// grow or allocate while processing packets.
+    #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+    pub tcp_flow_cache_capacity: usize,
+
     /// Set the IEEE802.15.4 PAN ID the interface will use.
     ///
     /// **NOTE**: we use the same PAN ID for destination and source.
@@ -240,6 +225,8 @@ impl Config {
         Config {
             random_seed: 0,
             hardware_addr,
+            #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+            tcp_flow_cache_capacity: 16_384,
             #[cfg(feature = "medium-ieee802154")]
             pan_id: None,
         }
@@ -329,7 +316,7 @@ impl Interface {
                 rand,
                 egress_start_index: 0,
                 #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
-                tcp_flow_cache: BTreeMap::new(),
+                tcp_flow_cache: TcpFlowCache::new(config.tcp_flow_cache_capacity),
                 #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
                 tcp_probe_cache_hits: 0,
                 #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
@@ -345,6 +332,23 @@ impl Interface {
     /// The context is needed for some socket methods.
     pub fn context(&mut self) -> &mut InterfaceInner {
         &mut self.inner
+    }
+
+    /// Register an established TCP 4-tuple before its first inbound packet.
+    #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+    pub fn register_tcp_flow(
+        &mut self,
+        handle: SocketHandle,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+    ) -> Result<(), TcpFlowCacheError> {
+        self.inner.register_tcp_flow(handle, local, remote)
+    }
+
+    /// Remove the TCP flow owned by `handle` from both cache indexes.
+    #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+    pub fn unregister_tcp_flow(&mut self, handle: SocketHandle) -> bool {
+        self.inner.unregister_tcp_flow(handle)
     }
 
     #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
@@ -957,6 +961,24 @@ impl Interface {
 }
 
 impl InterfaceInner {
+    /// Register an established TCP 4-tuple before its first inbound packet.
+    #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+    pub fn register_tcp_flow(
+        &mut self,
+        handle: SocketHandle,
+        local: IpEndpoint,
+        remote: IpEndpoint,
+    ) -> Result<(), TcpFlowCacheError> {
+        self.tcp_flow_cache
+            .insert(TcpFlowKey::new(local, remote), handle)
+    }
+
+    /// Remove the TCP flow owned by `handle` from both cache indexes.
+    #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+    pub fn unregister_tcp_flow(&mut self, handle: SocketHandle) -> bool {
+        self.tcp_flow_cache.remove_handle(handle)
+    }
+
     #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
     pub(crate) fn record_tcp_probe_cache_hit(&mut self) {
         self.tcp_probe_cache_hits = self.tcp_probe_cache_hits.saturating_add(1);
