@@ -1622,14 +1622,15 @@ impl<'a, B: SocketBufferT<'a>> Socket<'a, B> {
     /// This deliberately implements a lossy receive mode for latency-sensitive
     /// feeds. It does not validate continuity against the current receive
     /// sequence, does not reassemble skipped segments, and does not copy the
-    /// selected payload into the receive buffer. Any buffered receive data and
-    /// out-of-order ranges are discarded, and the cumulative receive sequence
-    /// is forced to the end of `repr`.
+    /// selected payload into the receive buffer. The activation boundary must
+    /// call [`Socket::prepare_lossy_tail`] once; thereafter this method only
+    /// forces the cumulative receive sequence to the end of `repr`.
     ///
     /// Peer acknowledgement, window, timestamp and control information are
     /// applied to this socket's existing sender/control state. This keeps the
     /// socket as the single owner of retransmit and transmit-buffer state while
     /// allowing the payload to be consumed by a separate raw-tail path.
+    #[inline(always)]
     pub fn commit_lossy_tail(
         &mut self,
         timestamp: Instant,
@@ -1670,15 +1671,13 @@ impl<'a, B: SocketBufferT<'a>> Socket<'a, B> {
             .map(|ack_number| self.remote_last_seq <= ack_number)
             .unwrap_or(false);
 
-        self.rx_buffer.clear();
-        self.assembler.clear();
         self.remote_seq_no = repr.seq_number + repr.segment_len();
         self.local_rx_last_seq = Some(repr.seq_number);
         if repr.control == TcpControl::Fin {
             self.rx_fin_received = true;
         }
 
-        if let Some(ack_number) = peer_ack {
+        if (acknowledged != 0 || ack_of_fin) && let Some(ack_number) = peer_ack {
             self.rtte.on_ack(timestamp, ack_number);
             self.congestion_controller
                 .inner_mut()
@@ -1699,6 +1698,13 @@ impl<'a, B: SocketBufferT<'a>> Socket<'a, B> {
             acknowledged,
             closed: self.tuple.is_none(),
         })
+    }
+
+    /// Discard normal receive/reassembly cursors exactly once when ownership of
+    /// inbound payload moves to the raw-tail path. Backing bytes are untouched.
+    pub fn prepare_lossy_tail(&mut self) {
+        self.rx_buffer.clear();
+        self.assembler.clear();
     }
 
     fn apply_lossy_tail_control(
@@ -1754,10 +1760,12 @@ impl<'a, B: SocketBufferT<'a>> Socket<'a, B> {
         };
         let new_remote_win_len = (repr.window_len as usize) << (scale as usize);
         let is_window_update = new_remote_win_len != self.remote_win_len;
-        self.remote_win_len = new_remote_win_len;
-        self.congestion_controller
-            .inner_mut()
-            .set_remote_window(new_remote_win_len);
+        if is_window_update {
+            self.remote_win_len = new_remote_win_len;
+            self.congestion_controller
+                .inner_mut()
+                .set_remote_window(new_remote_win_len);
+        }
 
         if ack_len > 0 {
             debug_assert!(self.tx_buffer.len() >= ack_len);
@@ -9087,6 +9095,9 @@ mod test {
         assert_eq!(s.rx_buffer.enqueue_slice(b"obsolete"), 8);
         s.assembler.add(16, 4).unwrap();
         assert_eq!(s.send_slice(b"ping"), Ok(4));
+        s.prepare_lossy_tail();
+        assert!(s.rx_buffer.is_empty());
+        assert!(s.assembler.is_empty());
 
         let tail = TcpRepr {
             control: TcpControl::Psh,
@@ -9103,8 +9114,6 @@ mod test {
         assert_eq!(committed.receive_seq, REMOTE_SEQ + 506);
         assert_eq!(committed.acknowledged, 4);
         assert!(!committed.closed);
-        assert!(s.rx_buffer.is_empty());
-        assert!(s.assembler.is_empty());
         assert!(s.tx_buffer.is_empty());
         assert_eq!(s.local_seq_no, LOCAL_SEQ + 5);
         assert_eq!(s.remote_seq_no, REMOTE_SEQ + 506);

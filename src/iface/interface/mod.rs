@@ -44,7 +44,7 @@ use super::neighbor::{
 };
 use super::socket_set::{SocketHandle, SocketSet};
 #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
-use super::tcp_flow_cache::{TcpFlowCache, TcpFlowCacheError, TcpFlowKey};
+use super::tcp_flow_cache::{TcpFlowCache, TcpFlowCacheError, TcpFlowKey, TcpListenerCache};
 #[cfg(feature = "proto-sixlowpan")]
 use crate::config::IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT;
 use crate::config::IFACE_MAX_ADDR_COUNT;
@@ -292,6 +292,8 @@ pub struct InterfaceInner {
     egress_start_index: usize,
     #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
     tcp_flow_cache: TcpFlowCache,
+    #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+    tcp_listener_cache: TcpListenerCache,
     #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
     tcp_probe_cache_hits: usize,
     #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
@@ -436,6 +438,8 @@ impl Interface {
                 egress_start_index: 0,
                 #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
                 tcp_flow_cache: TcpFlowCache::new(config.tcp_flow_cache_capacity),
+                #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+                tcp_listener_cache: TcpListenerCache::new(config.tcp_flow_cache_capacity),
                 #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
                 tcp_probe_cache_hits: 0,
                 #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc", feature = "socket-tcp"))]
@@ -468,6 +472,22 @@ impl Interface {
     #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
     pub fn unregister_tcp_flow(&mut self, handle: SocketHandle) -> bool {
         self.inner.unregister_tcp_flow(handle)
+    }
+
+    /// Register a passive TCP socket in the fixed listener endpoint index.
+    #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+    pub fn register_tcp_listener(
+        &mut self,
+        handle: SocketHandle,
+        endpoint: IpListenEndpoint,
+    ) -> Result<(), TcpFlowCacheError> {
+        self.inner.tcp_listener_cache.insert(endpoint, handle)
+    }
+
+    /// Remove a passive TCP socket from the listener endpoint index.
+    #[cfg(all(feature = "alloc", feature = "socket-tcp"))]
+    pub fn unregister_tcp_listener(&mut self, handle: SocketHandle) -> bool {
+        self.inner.tcp_listener_cache.remove_handle(handle)
     }
 
     /// Configure the single gateway whose last-known-good link address may be
