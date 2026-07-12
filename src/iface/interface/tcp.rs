@@ -71,8 +71,48 @@ impl InterfaceInner {
                 #[cfg(any(feature = "latency-probe", feature = "market-trace"))]
                 self.record_tcp_probe_cache_miss();
             }
+
+            while let Some(handle) = self
+                .tcp_listener_cache
+                .get(ip_repr.dst_addr(), tcp_repr.dst_port)
+            {
+                let mut stale = true;
+                let handled = sockets.item_mut_at(handle.index()).and_then(|item| {
+                    if let crate::socket::Socket::Tcp(ref mut tcp_socket) = item.socket {
+                        if tcp_socket.is_listening() && tcp_socket.accepts(self, &ip_repr, &tcp_repr)
+                        {
+                            stale = false;
+                            on_touched(item.meta.handle);
+                            let packet = tcp_socket
+                                .process(self, &ip_repr, &tcp_repr)
+                                .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
+                            if !tcp_socket.is_listening() {
+                                self.tcp_listener_cache.remove_handle(item.meta.handle);
+                                let key = TcpFlowKey::from_incoming(&ip_repr, &tcp_repr);
+                                if let Err(error) = self.tcp_flow_cache.insert(key, item.meta.handle) {
+                                    net_debug!("TCP flow cache registration failed: {:?}", error);
+                                }
+                            }
+                            Some(packet)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                });
+                if let Some(packet) = handled {
+                    return packet;
+                }
+                if stale {
+                    self.tcp_listener_cache.remove_handle(handle);
+                } else {
+                    break;
+                }
+            }
         }
 
+        #[cfg(not(feature = "alloc"))]
         for item in sockets.items_mut() {
             if let crate::socket::Socket::Tcp(ref mut tcp_socket) = item.socket {
                 #[cfg(all(any(feature = "latency-probe", feature = "market-trace"), feature = "alloc"))]
@@ -82,17 +122,6 @@ impl InterfaceInner {
                     let packet = tcp_socket
                         .process(self, &ip_repr, &tcp_repr)
                         .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
-                    #[cfg(feature = "alloc")]
-                    {
-                        let key = TcpFlowKey::from_incoming(&ip_repr, &tcp_repr);
-                        if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
-                            if let Err(error) = self.tcp_flow_cache.insert(key, item.meta.handle) {
-                                net_debug!("TCP flow cache registration failed: {:?}", error);
-                            }
-                        } else {
-                            self.tcp_flow_cache.remove_key(&key);
-                        }
-                    }
                     return packet;
                 }
             }

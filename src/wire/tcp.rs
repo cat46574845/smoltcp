@@ -860,6 +860,72 @@ impl TcpTimestampRepr {
 }
 
 impl<'a> Repr<'a> {
+    /// Parse only the TCP state carried by a raw-tail packet selected after an
+    /// RX drain. The caller has already classified the packet as IPv4/TCP;
+    /// handshake-only MSS, window-scale and SACK options are intentionally not
+    /// materialized. Timestamp remains necessary for established-state replies.
+    #[inline(always)]
+    pub fn parse_lossy_tail<T>(packet: &Packet<&'a T>) -> Result<Repr<'a>>
+    where
+        T: AsRef<[u8]> + ?Sized,
+    {
+        packet.check_len()?;
+        if packet.src_port() == 0 || packet.dst_port() == 0 {
+            return Err(Error);
+        }
+
+        let control = match (packet.syn(), packet.fin(), packet.rst(), packet.psh()) {
+            (false, false, false, false) => Control::None,
+            (false, false, false, true) => Control::Psh,
+            (true, false, false, _) => Control::Syn,
+            (false, true, false, _) => Control::Fin,
+            (false, false, true, _) => Control::Rst,
+            _ => return Err(Error),
+        };
+        let ack_number = packet.ack().then(|| packet.ack_number());
+
+        let mut timestamp = None;
+        let mut options = packet.options();
+        if options.len() >= 12
+            && options[0] == field::OPT_NOP
+            && options[1] == field::OPT_NOP
+            && options[2] == field::OPT_TSTAMP
+            && options[3] == 10
+        {
+            timestamp = Some(TcpTimestampRepr::new(
+                NetworkEndian::read_u32(&options[4..8]),
+                NetworkEndian::read_u32(&options[8..12]),
+            ));
+        } else {
+            while !options.is_empty() {
+                let (next_options, option) = TcpOption::parse(options)?;
+                match option {
+                    TcpOption::EndOfList => break,
+                    TcpOption::TimeStamp { tsval, tsecr } => {
+                        timestamp = Some(TcpTimestampRepr::new(tsval, tsecr));
+                    }
+                    _ => {}
+                }
+                options = next_options;
+            }
+        }
+
+        Ok(Repr {
+            src_port: packet.src_port(),
+            dst_port: packet.dst_port(),
+            control,
+            seq_number: packet.seq_number(),
+            ack_number,
+            window_len: packet.window_len(),
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            timestamp,
+            payload: packet.payload(),
+        })
+    }
+
     /// Parse a Transmission Control Protocol packet and return a high-level representation.
     pub fn parse<T>(
         packet: &Packet<&'a T>,
@@ -1281,6 +1347,52 @@ mod test {
         let mut packet = Packet::new_unchecked(&mut bytes);
         packet.set_header_len(10);
         assert_eq!(packet.check_len(), Err(Error));
+    }
+
+    #[test]
+    fn lossy_tail_keeps_established_state_and_timestamp_only() {
+        let mut bytes = vec![0; 36];
+        {
+            let mut packet = Packet::new_unchecked(&mut bytes);
+            packet.set_src_port(443);
+            packet.set_dst_port(32000);
+            packet.set_seq_number(SeqNumber(100));
+            packet.set_ack_number(SeqNumber(200));
+            packet.set_header_len(32);
+            packet.clear_flags();
+            packet.set_ack(true);
+            packet.set_psh(true);
+            packet.set_window_len(4096);
+            packet.options_mut().copy_from_slice(&[
+                field::OPT_NOP,
+                field::OPT_NOP,
+                field::OPT_TSTAMP,
+                10,
+                0,
+                0,
+                0,
+                7,
+                0,
+                0,
+                0,
+                9,
+            ]);
+            packet.payload_mut().copy_from_slice(&[1, 2, 3, 4]);
+        }
+
+        let packet = Packet::new_unchecked(&bytes[..]);
+        let repr = Repr::parse_lossy_tail(&packet).expect("valid established tail packet");
+        assert_eq!(repr.src_port, 443);
+        assert_eq!(repr.dst_port, 32000);
+        assert_eq!(repr.control, Control::Psh);
+        assert_eq!(repr.seq_number, SeqNumber(100));
+        assert_eq!(repr.ack_number, Some(SeqNumber(200)));
+        assert_eq!(repr.window_len, 4096);
+        assert_eq!(repr.timestamp, Some(TcpTimestampRepr::new(7, 9)));
+        assert_eq!(repr.payload, &[1, 2, 3, 4]);
+        assert_eq!(repr.max_seg_size, None);
+        assert_eq!(repr.window_scale, None);
+        assert_eq!(repr.sack_ranges, [None, None, None]);
     }
 
     #[cfg(feature = "proto-ipv4")]
