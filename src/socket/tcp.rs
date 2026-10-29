@@ -589,6 +589,12 @@ pub struct Socket<'a, B: SocketBufferT<'a> = SocketBuffer<'a>> {
 
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
+    /// The wake for newly enqueued data is left to the socket's owner (`set_defer_rx_wake`).
+    #[cfg(feature = "async")]
+    defer_rx_wake: bool,
+    /// Data was enqueued while the wake was left to the owner, who has not taken it yet.
+    #[cfg(feature = "async")]
+    rx_wake_deferred: bool,
     #[cfg(feature = "async")]
     tx_waker: WakerRegistration,
 
@@ -659,6 +665,10 @@ impl<'a, B: SocketBufferT<'a>> Socket<'a, B> {
 
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
+            #[cfg(feature = "async")]
+            defer_rx_wake: false,
+            #[cfg(feature = "async")]
+            rx_wake_deferred: false,
             #[cfg(feature = "async")]
             tx_waker: WakerRegistration::new(),
 
@@ -743,6 +753,30 @@ impl<'a, B: SocketBufferT<'a>> Socket<'a, B> {
     #[cfg(feature = "async")]
     pub fn register_recv_waker(&mut self, waker: &Waker) {
         self.rx_waker.register(waker)
+    }
+
+    /// Leave the receive waker's wake for newly enqueued data to the socket's owner: after ingress it takes the
+    /// wake with [`take_deferred_rx_wake`](#method.take_deferred_rx_wake) and wakes with
+    /// [`wake_receiver`](#method.wake_receiver) when there is something left to read. State changes still wake
+    /// at once.
+    #[cfg(feature = "async")]
+    pub fn set_defer_rx_wake(&mut self, defer: bool) {
+        self.defer_rx_wake = defer;
+        if !defer && core::mem::take(&mut self.rx_wake_deferred) {
+            self.rx_waker.wake();
+        }
+    }
+
+    /// Whether data was enqueued, its wake left to the owner, since the last call.
+    #[cfg(feature = "async")]
+    pub fn take_deferred_rx_wake(&mut self) -> bool {
+        core::mem::take(&mut self.rx_wake_deferred)
+    }
+
+    /// Wake the registered receive waker, if any.
+    #[cfg(feature = "async")]
+    pub fn wake_receiver(&mut self) {
+        self.rx_waker.wake();
     }
 
     /// Register a waker for send operations.
@@ -966,6 +1000,7 @@ impl<'a, B: SocketBufferT<'a>> Socket<'a, B> {
 
         #[cfg(feature = "async")]
         {
+            self.rx_wake_deferred = false;
             self.rx_waker.wake();
             self.tx_waker.wake();
         }
@@ -2334,7 +2369,11 @@ impl<'a, B: SocketBufferT<'a>> Socket<'a, B> {
                     let ns = ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
                     eprintln!("[SMOLTCP] rx_waker.wake() at ns={}", ns);
                 }
-                self.rx_waker.wake();
+                if self.defer_rx_wake {
+                    self.rx_wake_deferred = true;
+                } else {
+                    self.rx_waker.wake();
+                }
             }
         }
 
